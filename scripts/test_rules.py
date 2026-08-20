@@ -366,6 +366,11 @@ check(build.decode_if_base64(encoded.rstrip("=")) == "vless://a\nvless://b",
 check(build.decode_if_base64("not base64 and no scheme") == "not base64 and no scheme",
       "sources: undecodable text is left alone rather than mangled")
 check(build.decode_if_base64("") == "", "sources: empty body is handled")
+# A list may open with a long comment header, so the plain-text check has to
+# scan the whole body rather than a prefix.
+long_header = "# " + ("x" * 8000) + "\nvless://uid@1.2.3.4:443?type=ws&host=a.example\n"
+check(build.decode_if_base64(long_header) == long_header,
+      "sources: plain text is recognised even behind a long header")
 
 saved = {k: os.environ.get(k) for k in ("SOURCE_URLS", "SOURCE_URL")}
 try:
@@ -376,6 +381,14 @@ try:
     os.environ["SOURCE_URLS"] = "http://a/1.txt\nhttp://b/2.txt"
     check(build.load_sources() == ["http://a/1.txt", "http://b/2.txt"],
           "sources: SOURCE_URLS accepts newline separation")
+    os.environ["SOURCE_URLS"] = "http://a/1.txt,http://a/1.txt,http://b/2.txt"
+    check(build.load_sources() == ["http://a/1.txt", "http://b/2.txt"],
+          "sources: a URL listed twice is fetched once, order preserved")
+    # Isolates the per-line BOM strip: this path never goes through the
+    # utf-8-sig file read, so only _clean can be cleaning it up.
+    os.environ["SOURCE_URLS"] = "﻿http://a/1.txt"
+    check(build.load_sources() == ["http://a/1.txt"],
+          "sources: a stray BOM is stripped even outside the sources file")
     os.environ.pop("SOURCE_URLS")
     os.environ["SOURCE_URL"] = "http://only/1.txt"
     check(build.load_sources() == ["http://only/1.txt"],
@@ -394,6 +407,12 @@ try:
             "   https://example.invalid/two.txt   \n"
             "   # an indented comment\n"
         )
+    # Notepad writes UTF-8 with a BOM by default, and an unstripped BOM ends up
+    # glued to the first URL, making it unusable.
+    bom_file = os.path.join(scratch, "sources-bom.txt")
+    with open(bom_file, "w", encoding="utf-8-sig") as handle:
+        handle.write("# comment\nhttps://example.invalid/bom.txt\n")
+
     real_sources_file = build.SOURCES_FILE
     try:
         build.SOURCES_FILE = fake
@@ -401,6 +420,11 @@ try:
             build.load_sources()
             == ["https://example.invalid/one.txt", "https://example.invalid/two.txt"],
             "sources: sources.txt is read, with comments and blank lines skipped",
+        )
+        build.SOURCES_FILE = bom_file
+        check(
+            build.load_sources() == ["https://example.invalid/bom.txt"],
+            "sources: a byte-order mark does not corrupt the first URL",
         )
     finally:
         build.SOURCES_FILE = real_sources_file
@@ -509,6 +533,15 @@ completed, _, produced = run_build(
 check(completed.returncode == 0, "sources: a dead source does not fail the build")
 check("live.example" in produced, "sources: the surviving source still publishes")
 check("unreachable source" in completed.stdout, "sources: the dead source is reported")
+
+# A URL with no scheme is the likeliest typo in a hand-edited sources.txt.
+# urllib raises ValueError for it, which is not a URLError, so left unhandled
+# it would abort the whole build -- healthy sources included -- with a
+# traceback rather than naming the bad line.
+completed, _, produced = run_build("raw.example.com/no-scheme.txt," + serve(GOOD_BODY))
+check(completed.returncode == 0, "sources: a URL with no scheme does not sink the build")
+check("live.example" in produced, "sources: the valid source still publishes alongside a typo")
+check("Traceback" not in completed.stderr, "sources: a malformed URL reports, not crashes")
 
 # Every source dead is a different matter.
 completed, untouched, _ = run_build(

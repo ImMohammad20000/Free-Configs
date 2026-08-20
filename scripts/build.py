@@ -82,27 +82,43 @@ def load_sources() -> list[str]:
     from_env = os.environ.get("SOURCE_URLS") or os.environ.get("SOURCE_URL")
     if from_env:
         # Accept commas, whitespace or newlines as separators.
-        urls = [u.strip() for u in from_env.replace(",", "\n").split() if u.strip()]
+        urls = _clean(from_env.replace(",", "\n").split())
         if urls:
             return urls
 
     if os.path.exists(SOURCES_FILE):
-        with open(SOURCES_FILE, encoding="utf-8") as handle:
-            urls = [
-                line.strip()
-                for line in handle
-                if line.strip() and not line.lstrip().startswith("#")
-            ]
+        # utf-8-sig, not utf-8: Notepad writes a BOM by default, and it would
+        # otherwise end up glued to the first URL as ﻿https://...
+        with open(SOURCES_FILE, encoding="utf-8-sig") as handle:
+            urls = _clean(
+                line for line in handle if not line.lstrip().lstrip("﻿").startswith("#")
+            )
         if urls:
             return urls
 
     return list(DEFAULT_SOURCES)
 
 
+def _clean(lines) -> list[str]:
+    """Trim, drop blanks, strip any stray BOM, and drop repeats while keeping
+    the original order -- listing a URL twice should not fetch it twice."""
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for line in lines:
+        url = line.strip().lstrip("﻿").strip()
+        if url and url not in seen:
+            seen.add(url)
+            cleaned.append(url)
+    return cleaned
+
+
 def decode_if_base64(text: str) -> str:
     """Many subscription URLs serve the list base64-encoded. Detect that and
     decode, so adding a source does not mean caring which form it uses."""
-    if "://" in text[:4096]:
+    # Scan the whole body, not a prefix: a list can open with a long comment
+    # header. Base64's alphabet has no ":", so a "://" anywhere proves the
+    # body is already plain text.
+    if "://" in text:
         return text
     compact = "".join(text.split())
     if not compact:
@@ -146,6 +162,12 @@ def fetch(url: str) -> str:
             )
             with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT) as response:
                 return response.read().decode("utf-8", "replace")
+        except ValueError as error:
+            # urllib raises ValueError, not URLError, for a URL with no scheme
+            # -- the likeliest typo in a hand-edited sources.txt. Left to
+            # escape it would kill the whole build, taking the healthy sources
+            # with it, and print a traceback instead of naming the bad line.
+            raise SystemExit(f"could not fetch {url}: {error}") from None
         except RETRYABLE_FETCH_ERRORS as error:
             if is_permanent_http_error(error):
                 # A wrong or removed URL will answer the same way every time;

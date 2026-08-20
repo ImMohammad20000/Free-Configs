@@ -68,10 +68,16 @@ lines dropped before the rules run.
 
 Adding a low-quality source costs build time but cannot put a dead node in
 `configs.txt`: every node from every source goes through the same rules and the
-same health check. If one source is unreachable the build continues with the
-rest and says so; it only fails if *every* source is unreachable. A URL that is
-simply wrong (404, 410, 403) is not retried, so a stale entry costs one request
-rather than four.
+same health check.
+
+A bad line in `sources.txt` never sinks the build. If one source is unreachable,
+returns 404, or is simply mistyped — including the easy mistake of leaving off
+`https://` — the build continues with the remaining sources and reports the bad
+one by name. It fails only if *every* source is unusable, and in that case the
+previous `configs.txt` is left untouched. A URL that is permanently wrong (404,
+410, 403, or malformed) is not retried, so a stale entry costs one request
+rather than four. A byte-order mark, which Notepad adds to UTF-8 files by
+default, is stripped rather than glued onto the first URL.
 
 For a one-off run against different sources without editing the file:
 
