@@ -318,6 +318,104 @@ for node in grpc:
         "outbound: grpc authority comes from host",
     )
 
+# --- health check: routing safety and bisection ------------------------------
+# These do not need a network or an Xray binary, but they guard the property
+# everything else rests on: a node must only be able to pass by carrying real
+# traffic through its own outbound.
+
+import healthcheck  # noqa: E402
+
+batch = [n for spec in ({}, {"host": "b.example"}, {"host": "c.example"}) for n in one(**{**BASE, **spec})]
+config = healthcheck._build_config(batch, healthcheck.BASE_PORT)
+
+# If the default outbound were freedom rather than blackhole, traffic that
+# missed its rule would go out directly and EVERY node would look healthy.
+check(config["outbounds"][0]["protocol"] == "blackhole",
+      "healthcheck: the default outbound is a blackhole, so nothing leaks direct")
+check(not any(o.get("protocol") == "freedom" for o in config["outbounds"]),
+      "healthcheck: no freedom outbound exists to fall through to")
+check(config["routing"]["rules"][-1]["outboundTag"] == "block",
+      "healthcheck: a catch-all rule blocks anything unmatched")
+
+rules = config["routing"]["rules"][:-1]
+check(len(rules) == len(batch), "healthcheck: every node gets exactly one routing rule")
+check(
+    all(r["inboundTag"] == [f"in-{i}"] and r["outboundTag"] == f"out-{i}"
+        for i, r in enumerate(rules)),
+    "healthcheck: inbound N routes to outbound N, never to a neighbour",
+)
+ports = [i["port"] for i in config["inbounds"]]
+check(ports == list(range(healthcheck.BASE_PORT, healthcheck.BASE_PORT + len(batch))),
+      "healthcheck: inbound ports are unique and sequential")
+check(all(i["listen"] == "127.0.0.1" for i in config["inbounds"]),
+      "healthcheck: inbounds bind loopback only")
+check(
+    [o["tag"] for o in config["outbounds"][1:]] == [f"out-{i}" for i in range(len(batch))],
+    "healthcheck: outbound order matches node order",
+)
+
+# Bisection must isolate exactly the offending node, keeping the rest.
+POISON = "deadbeef-dead-beef-dead-beefdeadbeef"
+poisoned = batch[0].copy()
+poisoned.uid = POISON
+mixed = batch[:2] + [poisoned] + batch[2:]
+
+
+def _stub_accepted(xray, cfg, directory):
+    """Stand in for Xray: reject any config containing the poisoned node."""
+    for outbound in cfg["outbounds"]:
+        for target in outbound.get("settings", {}).get("vnext", []):
+            for user in target.get("users", []):
+                if user.get("id") == POISON:
+                    return False
+    return True
+
+
+real_accepted = healthcheck._config_accepted
+try:
+    healthcheck._config_accepted = _stub_accepted
+    ok, bad = healthcheck.validate_nodes("xray", mixed, tempfile.gettempdir())
+    check(len(bad) == 1 and bad[0].uid == POISON,
+          "healthcheck: bisection isolates exactly the rejected node")
+    check(len(ok) == len(mixed) - 1 and all(n.uid != POISON for n in ok),
+          "healthcheck: the other nodes survive one bad node")
+
+    # A node whose outbound cannot even be rendered must be rejected, not fatal.
+    broken = batch[0].copy()
+    broken.uid = "broken-node"
+    broken.set("fm", "{not valid json")
+    ok, bad = healthcheck.validate_nodes("xray", batch[:2] + [broken], tempfile.gettempdir())
+    check(len(bad) == 1 and bad[0].uid == "broken-node",
+          "healthcheck: an unrenderable outbound is rejected rather than crashing")
+    check(len(ok) == 2, "healthcheck: an unrenderable node does not take the batch with it")
+finally:
+    healthcheck._config_accepted = real_accepted
+
+# The preflight has to exercise both shapes the pipeline emits, or it proves
+# nothing about the core it is about to trust.
+probes = healthcheck.preflight_probes()
+check({node.port for _, node in probes} == {"443", "8080"},
+      "healthcheck: preflight checks both the TLS and the plaintext shape")
+tls_probe = next(node for _, node in probes if node.port == "443")
+plain_probe = next(node for _, node in probes if node.port == "8080")
+check(
+    tls_probe.get("fp") == "unsafe"
+    and tls_probe.get("fm") == transform.FM_443
+    and tls_probe.get("cs") == transform.CS_443,
+    "healthcheck: the TLS probe carries the real fp, fm and cs values",
+)
+check(plain_probe.get("fm") == transform.FM_8080 and plain_probe.security == "none",
+      "healthcheck: the plaintext probe is an unencrypted outbound with the 8080 fm")
+check(
+    all(node.address == transform.ADDRESS_FOR_PORT_443
+        or node.address == transform.ADDRESS_FOR_PORT_8080 for _, node in probes),
+    "healthcheck: probes use the real exit address, not a placeholder",
+)
+for _, node in probes:
+    rendered = json.dumps(healthcheck._build_config([node], healthcheck.BASE_PORT))
+    check("finalmask" in rendered, f"healthcheck: the port {node.port} probe renders a finalmask")
+
+
 # --- fetch retry coverage --------------------------------------------------
 # A truncated response raises IncompleteRead, which is an HTTPException and NOT
 # an OSError, so a handler catching only OSError silently skips the retry and

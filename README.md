@@ -224,8 +224,11 @@ python scripts/test_rules.py
 [`scripts/test_rules.py`](scripts/test_rules.py) covers every numbered rule,
 the parser's edge cases (bracketed IPv6, userinfo containing `@` and `:`,
 encoded `=` inside a value, missing fragment, malformed input), deduplication,
-the rendered Xray outbound, which fetch failures are retried, and the refusal
-to publish when the source returns something unusable. It needs no test
+the rendered Xray outbound, which fetch failures are retried, the refusal to
+publish when the source returns something unusable, and the health check's
+routing safety — that the default outbound is a blackhole and each inbound
+reaches only its own node, since a leak there would make every node look
+healthy. It needs no test
 framework, stays offline (the one integration case serves itself over
 loopback), runs in well under a second, and runs in the workflow before
 anything else — so a broken rule fails the build instead of publishing bad

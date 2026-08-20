@@ -114,10 +114,20 @@ def validate_nodes(
     is it bisected, so one malformed node cannot take a whole batch down with it.
     """
 
+    def group_builds(group: list[Node]) -> bool:
+        try:
+            config = _build_config(group, BASE_PORT)
+        except Exception:
+            # A node whose outbound cannot even be rendered -- unparseable fm,
+            # say -- is a node to reject, not a reason to abandon the run. The
+            # bisect below then narrows it down to the one at fault.
+            return False
+        return _config_accepted(xray, config, directory)
+
     def recurse(group: list[Node]) -> tuple[list[Node], list[Node]]:
         if not group:
             return [], []
-        if _config_accepted(xray, _build_config(group, BASE_PORT), directory):
+        if group_builds(group):
             return list(group), []
         if len(group) == 1:
             return [], list(group)
@@ -163,8 +173,19 @@ def preflight(xray: str) -> list[str]:
         return [f"'{xray} version' exited {version.returncode}"]
     print(f"  core: {version.stdout.decode('utf-8', 'replace').splitlines()[0]}")
 
+    failures: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="xray-preflight-") as directory:
+        for description, node in preflight_probes():
+            if not _config_accepted(xray, _build_config([node], BASE_PORT), directory):
+                failures.append(description)
+    return failures
+
+
+def preflight_probes() -> list[tuple[str, Node]]:
+    """The two configurations the pipeline actually emits: a TLS node carrying
+    the full masking set, and a plaintext node on the public exit address."""
     blank_uuid = "00000000-0000-0000-0000-000000000000"
-    probes = [
+    return [
         (
             "port 443 masking (fp=unsafe + fm fragment + cs cipherSuites)",
             Node(
@@ -203,13 +224,6 @@ def preflight(xray: str) -> list[str]:
             ),
         ),
     ]
-
-    failures: list[str] = []
-    with tempfile.TemporaryDirectory(prefix="xray-preflight-") as directory:
-        for description, node in probes:
-            if not _config_accepted(xray, _build_config([node], BASE_PORT), directory):
-                failures.append(description)
-    return failures
 
 
 def _wait_until_listening(
