@@ -1,6 +1,6 @@
 # Free-Configs
 
-Just add subscription link to [PattNG](https://github.com/patterniha/PattNG) and enjoy!
+Just add subscription link to [PattNG](https://github.com/patterniha/PattNG) and enjoy !
  
 ```
 https://raw.githubusercontent.com/patterniha/Free-Configs/main/configs.txt
