@@ -134,9 +134,13 @@ def validate_nodes(
     return accepted, rejected
 
 
-def _wait_until_listening(ports: list[int], deadline: float) -> bool:
+def _wait_until_listening(
+    ports: list[int], deadline: float, process: subprocess.Popen | None = None
+) -> bool:
     for port in ports:
         while True:
+            if process is not None and process.poll() is not None:
+                return False  # Xray exited; no point waiting out the deadline
             if time.monotonic() > deadline:
                 return False
             try:
@@ -145,6 +149,15 @@ def _wait_until_listening(ports: list[int], deadline: float) -> bool:
             except OSError:
                 time.sleep(0.05)
     return True
+
+
+def _log_tail(path: str, lines: int = 6) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            tail = [l.rstrip() for l in handle if l.strip()][-lines:]
+        return "\n".join("      " + l[:200] for l in tail)
+    except OSError:
+        return "      (no log)"
 
 
 def _probe(port: int) -> tuple[bool, float]:
@@ -191,7 +204,15 @@ def _run_batch(
         )
         try:
             ports = [BASE_PORT, BASE_PORT + len(batch) - 1]
-            if not _wait_until_listening(ports, time.monotonic() + STARTUP_TIMEOUT):
+            deadline = time.monotonic() + STARTUP_TIMEOUT
+            if not _wait_until_listening(ports, deadline, process):
+                # Distinguish "Xray never came up" from "every node failed" --
+                # otherwise a bind error silently reads as 32 dead nodes.
+                print(
+                    f"  ! {label}: Xray did not start (exit={process.poll()});"
+                    f" {len(batch)} nodes not tested this round"
+                )
+                print(_log_tail(log_path))
                 return {}
             with ThreadPoolExecutor(max_workers=PROBE_WORKERS) as pool:
                 results = list(pool.map(lambda i: _probe(BASE_PORT + i), range(len(batch))))
