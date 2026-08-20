@@ -28,6 +28,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import transform
 from nodes import Node
 
 TEST_HOST = "cp.cloudflare.com"
@@ -132,6 +133,83 @@ def validate_nodes(
         accepted.extend(chunk_ok)
         rejected.extend(chunk_bad)
     return accepted, rejected
+
+
+def preflight(xray: str) -> list[str]:
+    """Check that this core understands everything the emitted links rely on.
+
+    Without this, an unsupported parameter shows up as "every node is dead"
+    three rounds later, with nothing pointing at the cause. Each probe uses the
+    same config shape the health check builds, so a core that accepts these
+    accepts the real thing.
+
+    ``cs`` maps to Xray's ``cipherSuites``, which is undocumented, and the
+    ``fm`` fragment's ``lengths``/``delays`` arrays only exist in cores based on
+    v26.6.22 or newer -- both are worth proving rather than assuming.
+    """
+    try:
+        version = subprocess.run(
+            [xray, "version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        # Every later check shells out to this binary, and a failure there would
+        # look like "no node works" rather than "the binary is unusable".
+        return [f"running '{xray} version' failed: {error}"]
+    if version.returncode != 0:
+        return [f"'{xray} version' exited {version.returncode}"]
+    print(f"  core: {version.stdout.decode('utf-8', 'replace').splitlines()[0]}")
+
+    blank_uuid = "00000000-0000-0000-0000-000000000000"
+    probes = [
+        (
+            "port 443 masking (fp=unsafe + fm fragment + cs cipherSuites)",
+            Node(
+                scheme="vless",
+                uid=blank_uuid,
+                address="188.114.97.6",
+                port="443",
+                params={
+                    "encryption": "none",
+                    "security": "tls",
+                    "type": "ws",
+                    "host": "example.com",
+                    "path": "/",
+                    "sni": "example.com",
+                    "fp": transform.FP_443,
+                    "fm": transform.FM_443,
+                    "cs": transform.CS_443,
+                },
+            ),
+        ),
+        (
+            "port 8080 unencrypted outbound to a public address (fm fragment)",
+            Node(
+                scheme="vless",
+                uid=blank_uuid,
+                address="188.114.97.6",
+                port="8080",
+                params={
+                    "encryption": "none",
+                    "security": "none",
+                    "type": "ws",
+                    "host": "example.com",
+                    "path": "/",
+                    "fm": transform.FM_8080,
+                },
+            ),
+        ),
+    ]
+
+    failures: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="xray-preflight-") as directory:
+        for description, node in probes:
+            if not _config_accepted(xray, _build_config([node], BASE_PORT), directory):
+                failures.append(description)
+    return failures
 
 
 def _wait_until_listening(

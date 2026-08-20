@@ -162,6 +162,17 @@ def main() -> int:
         counts["rounds"] = rounds
         xray = locate_xray()
         print(f"Health check via {xray} ({rounds} rounds)")
+        unsupported = healthcheck.preflight(xray)
+        if unsupported:
+            print("ERROR: this Xray-core build does not support:", file=sys.stderr)
+            for item in unsupported:
+                print(f"  - {item}", file=sys.stderr)
+            print(
+                "Use a build of https://github.com/patterniha/Xray-core based on"
+                " v26.6.22 or newer.",
+                file=sys.stderr,
+            )
+            return 1
         healthy = healthcheck.check(xray, transformed, counts, rounds=rounds)
         healthy_443 = sum(1 for node in healthy if node.port == "443")
         print(
@@ -181,7 +192,10 @@ def main() -> int:
     output_path = os.path.join(OUTPUT_DIR, OUTPUT_FILE)
     base64_path = os.path.join(OUTPUT_DIR, OUTPUT_FILE_BASE64)
 
-    if links == existing_links(output_path):
+    # Compared as a set, not a list: the health check orders by measured
+    # latency, which drifts run to run, so an order-sensitive comparison would
+    # rewrite the file and commit every day even when nothing actually changed.
+    if set(links) == set(existing_links(output_path)):
         print(f"{OUTPUT_FILE} already up to date ({len(links)} nodes); not rewriting")
         return 0
 

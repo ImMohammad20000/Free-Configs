@@ -26,25 +26,53 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Xray-core
+      - name: Install newest Xray-core
         env:
           # patterniha/Xray-core, not XTLS/Xray-core. The fork drops the
           # validateOutboundTransportSecurity check that forbids VLESS/Trojan
           # without TLS to a public address, which is exactly what every port
-          # 8080 node in this list is -- the upstream core cannot test them.
+          # 8080 node in this list is.
           #
-          # The base must stay >= v26.6.22: earlier cores reject the fragment
-          # "lengths"/"delays" arrays the fm parameter uses. To bump either,
-          # take the new SHA2-256 from the release's Xray-linux-64.zip.dgst.
+          # The newest release is resolved at run time, so publishing a release
+          # in the fork is all it takes for the next build to pick it up. The
+          # archive is checked against the SHA2-256 the release publishes
+          # alongside it: that catches a truncated or corrupted download, but
+          # since both files come from the same release it is not a defence
+          # against the release itself being replaced. scripts/build.py then
+          # preflights the core and fails if it does not support fm/cs/fp.
           XRAY_REPO: patterniha/Xray-core
-          XRAY_VERSION: v26.7.28-P1
-          XRAY_SHA256: a36b44fb466b6dd7db04586f5e7a19724f40c67f0031b19c80b5deb9039ca620
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          api="https://api.github.com/repos/${XRAY_REPO}"
+          auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "X-GitHub-Api-Version: 2022-11-28")
+
+          # /releases/latest ignores pre-releases; fall back to the most recent
+          # release of any kind so a pre-release-only fork still resolves.
+          tag="$(curl -fsSL --retry 3 --retry-delay 5 "${auth[@]}" "${api}/releases/latest" \
+                 | jq -r '.tag_name // empty' || true)"
+          if [ -z "$tag" ]; then
+            tag="$(curl -fsSL --retry 3 --retry-delay 5 "${auth[@]}" "${api}/releases?per_page=1" \
+                   | jq -r '.[0].tag_name // empty')"
+          fi
+          if [ -z "$tag" ]; then
+            echo "could not resolve a release tag from ${XRAY_REPO}" >&2
+            exit 1
+          fi
+          echo "Newest ${XRAY_REPO} release: ${tag}"
+
+          base="https://github.com/${XRAY_REPO}/releases/download/${tag}"
           zip="$RUNNER_TEMP/xray.zip"
-          curl -fsSL --retry 3 --retry-delay 5 -o "$zip" \
-            "https://github.com/${XRAY_REPO}/releases/download/${XRAY_VERSION}/Xray-linux-64.zip"
-          echo "${XRAY_SHA256}  ${zip}" | sha256sum -c -
+          curl -fsSL --retry 3 --retry-delay 5 -o "$zip" "${base}/Xray-linux-64.zip"
+          curl -fsSL --retry 3 --retry-delay 5 -o "$zip.dgst" "${base}/Xray-linux-64.zip.dgst"
+
+          expected="$(awk '/^SHA2-256=/ {print $2}' "$zip.dgst")"
+          if [ -z "$expected" ]; then
+            echo "no SHA2-256 line in Xray-linux-64.zip.dgst for ${tag}" >&2
+            exit 1
+          fi
+          echo "${expected}  ${zip}" | sha256sum -c -
+
           unzip -q "$zip" -d "$RUNNER_TEMP/xray"
           chmod +x "$RUNNER_TEMP/xray/xray"
           "$RUNNER_TEMP/xray/xray" version | head -n 1
@@ -63,7 +91,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add configs.txt configs_base64.txt
-          git commit -m "Update configs ($(grep -cv '^#' configs.txt) nodes)"
+          # grep -c exits 1 on a zero count, which set -e would turn into a
+          # failed step; build.py already refuses to publish an empty list.
+          nodes="$(grep -cv '^#' configs.txt || true)"
+          git commit -m "Update configs (${nodes:-0} nodes)"
           for attempt in 1 2 3; do
             if git push; then
               exit 0

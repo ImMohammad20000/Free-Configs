@@ -30,6 +30,8 @@ Rebuilt every 24 hours by [`.github/workflows/build.yml`](.github/workflows/buil
 >   arrays, which needs a core based on **v26.6.22 or newer**. Older cores
 >   reject it, and every v26.4+ upstream release is tagged as a pre-release, so
 >   the newest *stable* upstream release is not new enough.
+>
+> `cs` is Xray's `cipherSuites`; it works but is currently undocumented.
 
 ## Pipeline
 
@@ -91,8 +93,11 @@ marked `NORMALISATION` in the source.
 Nodes are also renamed to `port | host | protocol-transport | hash`. The
 upstream country flags become misleading once rule 10 sends every node to the
 same address, and rule 9 would otherwise give a node and its twin the same name.
-The hash is derived from the node's own contents, so an unchanged upstream
-produces a byte-identical `configs.txt` and no empty daily commit.
+The hash is derived from the node's own contents, so the same node always gets
+the same name. Nodes are then ordered fastest-first by median latency. Because
+that order drifts between runs, the "did anything change?" check compares the
+set of links rather than their order — an unchanged set means the file is left
+alone and the day produces no commit.
 
 ### vmess is excluded by default
 
@@ -109,7 +114,24 @@ independent runs*. That is reimplemented here directly against
 [patterniha/Xray-core](https://github.com/patterniha/Xray-core) rather than
 through a wrapper, so the `fm` / `cs` / `fp=unsafe` parameters in the emitted
 links are the ones actually exercised, and the non-TLS nodes can be tested at
-all. The workflow pins a release tag and verifies its SHA2-256 before use.
+all.
+
+The workflow resolves the **newest release of the fork at run time**, so
+publishing a release there is all it takes for the next build to use it. It
+falls back to the most recent release of any kind if `/releases/latest` finds
+none (which happens when every release is a pre-release), then verifies the
+archive against the SHA2-256 the release publishes beside it. That catches a
+truncated or corrupted download; because both files come from the same release
+it is not a defence against the release itself being replaced.
+
+Before testing anything, `build.py` **preflights the core**: it asks Xray to
+validate one port 443 config carrying `fp=unsafe` + `fm` + `cs`, and one port
+8080 config that is an unencrypted outbound to a public address. If the core
+rejects either, the build stops with that specific message instead of spending
+three rounds discovering that every node is "dead". `cs` maps to Xray's
+`cipherSuites`, which is undocumented, and the `fm` fragment's
+`lengths`/`delays` arrays need a core based on v26.6.22 or newer — both are
+worth proving rather than assuming.
 
 For each round, nodes are grouped into batches; each batch becomes one Xray
 process with one loopback HTTP inbound per node, routed to that node's outbound,
