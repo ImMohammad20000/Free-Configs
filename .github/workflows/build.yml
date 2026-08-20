@@ -1,0 +1,75 @@
+name: Build subscription
+
+on:
+  schedule:
+    # Every 24h. GitHub queues scheduled runs and can delay or skip them under
+    # load, so treat this as "about once a day" rather than a precise clock.
+    # An off-peak minute (not :00) tends to be dispatched more promptly.
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-subscription
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Xray-core
+        env:
+          # patterniha/Xray-core, not XTLS/Xray-core. The fork drops the
+          # validateOutboundTransportSecurity check that forbids VLESS/Trojan
+          # without TLS to a public address, which is exactly what every port
+          # 8080 node in this list is -- the upstream core cannot test them.
+          #
+          # The base must stay >= v26.6.22: earlier cores reject the fragment
+          # "lengths"/"delays" arrays the fm parameter uses. To bump either,
+          # take the new SHA2-256 from the release's Xray-linux-64.zip.dgst.
+          XRAY_REPO: patterniha/Xray-core
+          XRAY_VERSION: v26.7.28-P1
+          XRAY_SHA256: a36b44fb466b6dd7db04586f5e7a19724f40c67f0031b19c80b5deb9039ca620
+        run: |
+          set -euo pipefail
+          zip="$RUNNER_TEMP/xray.zip"
+          curl -fsSL --retry 3 --retry-delay 5 -o "$zip" \
+            "https://github.com/${XRAY_REPO}/releases/download/${XRAY_VERSION}/Xray-linux-64.zip"
+          echo "${XRAY_SHA256}  ${zip}" | sha256sum -c -
+          unzip -q "$zip" -d "$RUNNER_TEMP/xray"
+          chmod +x "$RUNNER_TEMP/xray/xray"
+          "$RUNNER_TEMP/xray/xray" version | head -n 1
+          echo "XRAY_BIN=$RUNNER_TEMP/xray/xray" >> "$GITHUB_ENV"
+
+      - name: Fetch, transform and health-check
+        run: python scripts/build.py
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain -- configs.txt configs_base64.txt)" ]; then
+            echo "configs.txt unchanged; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add configs.txt configs_base64.txt
+          git commit -m "Update configs ($(grep -cv '^#' configs.txt) nodes)"
+          for attempt in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "push failed (attempt ${attempt}); rebasing on origin"
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+          done
+          echo "could not push after 3 attempts" >&2
+          exit 1
