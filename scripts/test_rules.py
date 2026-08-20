@@ -8,9 +8,17 @@ test named after it, plus parser edge cases and end-to-end properties.
 
 from __future__ import annotations
 
+import base64
+import http.client
+import json
 import os
 import shutil
+import socket
+import subprocess
 import sys
+import tempfile
+import threading
+import urllib.error
 from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -285,7 +293,6 @@ for name, encoded, decoded in (
 
 # --- Xray outbound rendering ----------------------------------------------
 
-import json  # noqa: E402
 
 for node in one(**BASE):
     outbound = json.loads(json.dumps(node.to_outbound("t")))
@@ -316,8 +323,6 @@ for node in grpc:
 # an OSError, so a handler catching only OSError silently skips the retry and
 # lets the error escape as a traceback.
 
-import http.client  # noqa: E402
-import urllib.error  # noqa: E402
 
 import build  # noqa: E402
 
@@ -335,69 +340,159 @@ for exc in (
         f"fetch: {exc.__name__} is retried rather than fatal",
     )
 
+
+def _http_error(code: int):
+    return urllib.error.HTTPError("http://x", code, "msg", {}, None)
+
+
+# A wrong URL answers the same way every time; retrying it only delays the
+# other sources. 408 and 429 explicitly mean "try again", and 5xx is transient.
+for code in (400, 401, 403, 404, 410):
+    check(build.is_permanent_http_error(_http_error(code)), f"fetch: HTTP {code} is not retried")
+for code in (408, 429, 500, 502, 503):
+    check(not build.is_permanent_http_error(_http_error(code)), f"fetch: HTTP {code} is retried")
+check(not build.is_permanent_http_error(TimeoutError()), "fetch: a timeout is retried")
+
+
+# --- sources ----------------------------------------------------------------
+
+check(build.decode_if_base64("vless://x\ntrojan://y") == "vless://x\ntrojan://y",
+      "sources: plain text passes through untouched")
+encoded = base64.b64encode(b"vless://a\nvless://b").decode()
+check(build.decode_if_base64(encoded) == "vless://a\nvless://b",
+      "sources: a base64 list is decoded")
+check(build.decode_if_base64(encoded.rstrip("=")) == "vless://a\nvless://b",
+      "sources: base64 missing its padding still decodes")
+check(build.decode_if_base64("not base64 and no scheme") == "not base64 and no scheme",
+      "sources: undecodable text is left alone rather than mangled")
+check(build.decode_if_base64("") == "", "sources: empty body is handled")
+
+saved = {k: os.environ.get(k) for k in ("SOURCE_URLS", "SOURCE_URL")}
+try:
+    os.environ.pop("SOURCE_URL", None)
+    os.environ["SOURCE_URLS"] = "http://a/1.txt, http://b/2.txt"
+    check(build.load_sources() == ["http://a/1.txt", "http://b/2.txt"],
+          "sources: SOURCE_URLS accepts a comma-separated list")
+    os.environ["SOURCE_URLS"] = "http://a/1.txt\nhttp://b/2.txt"
+    check(build.load_sources() == ["http://a/1.txt", "http://b/2.txt"],
+          "sources: SOURCE_URLS accepts newline separation")
+    os.environ.pop("SOURCE_URLS")
+    os.environ["SOURCE_URL"] = "http://only/1.txt"
+    check(build.load_sources() == ["http://only/1.txt"],
+          "sources: the older SOURCE_URL still works")
+    os.environ.pop("SOURCE_URL")
+    # Point at a throwaway file with distinctive URLs. Reading the real
+    # sources.txt could not prove anything: it currently holds the same URL as
+    # DEFAULT_SOURCES, so ignoring the file entirely would look identical.
+    scratch = tempfile.mkdtemp(prefix="free-configs-sources-")
+    fake = os.path.join(scratch, "sources.txt")
+    with open(fake, "w", encoding="utf-8") as handle:
+        handle.write(
+            "# a comment\n"
+            "\n"
+            "https://example.invalid/one.txt\n"
+            "   https://example.invalid/two.txt   \n"
+            "   # an indented comment\n"
+        )
+    real_sources_file = build.SOURCES_FILE
+    try:
+        build.SOURCES_FILE = fake
+        check(
+            build.load_sources()
+            == ["https://example.invalid/one.txt", "https://example.invalid/two.txt"],
+            "sources: sources.txt is read, with comments and blank lines skipped",
+        )
+    finally:
+        build.SOURCES_FILE = real_sources_file
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    shipped = build.load_sources()
+    check(
+        bool(shipped) and all(u.startswith("http") for u in shipped),
+        "sources: the repository's own sources.txt yields usable URLs",
+    )
+finally:
+    for key, value in saved.items():
+        os.environ.pop(key, None)
+        if value is not None:
+            os.environ[key] = value
+
 # --- refusing to publish rubbish -------------------------------------------
 # A source can return HTTP 200 and still be useless (an error page, or a
 # changed format). build.py must fail and leave the previous configs.txt alone
 # rather than publishing an empty subscription. Served from loopback so the
 # test stays offline.
 
-import socket  # noqa: E402
-import subprocess  # noqa: E402
-import tempfile  # noqa: E402
-import threading  # noqa: E402
 
 
-def _serve_once(sock: socket.socket, body: bytes) -> None:
-    try:
-        conn, _ = sock.accept()
-    except OSError:
-        return
-    with conn:
-        try:
-            conn.recv(4096)
-            conn.sendall(
-                b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body)
-                + body
-            )
-        except OSError:
-            pass
+SERVERS: list[socket.socket] = []
 
 
-listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-listener.bind(("127.0.0.1", 0))
-listener.listen(1)
-listener.settimeout(30)
-served_port = listener.getsockname()[1]
-threading.Thread(
-    target=_serve_once, args=(listener, b"<html><body>404 Not Found</body></html>"), daemon=True
-).start()
+def serve(body: bytes, status: str = "200 OK") -> str:
+    """Serve one canned response on a loopback port; return its URL."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(4)
+    sock.settimeout(30)
+    SERVERS.append(sock)
+    head = (
+        f"HTTP/1.1 {status}\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+    ).encode()
 
-staging = tempfile.mkdtemp(prefix="free-configs-test-")
-sentinel = "#header\nvless://PREEXISTING\n"
-with open(os.path.join(staging, "configs.txt"), "w", encoding="utf-8", newline="\n") as handle:
-    handle.write(sentinel)
+    def loop() -> None:
+        while True:
+            try:
+                conn, _ = sock.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.recv(4096)
+                    conn.sendall(head + body)
+                except OSError:
+                    pass
 
-environment = dict(os.environ)
-environment.update(
-    SOURCE_URL=f"http://127.0.0.1:{served_port}/list.txt",
-    OUTPUT_DIR=staging,
-    SKIP_HEALTHCHECK="1",
-    PYTHONIOENCODING="utf-8",
+    threading.Thread(target=loop, daemon=True).start()
+    return f"http://127.0.0.1:{sock.getsockname()[1]}/list.txt"
+
+
+def run_build(source_urls: str) -> tuple[subprocess.CompletedProcess, bool, str]:
+    """Run build.py against the given sources; report whether a pre-existing
+    configs.txt survived, and its final contents."""
+    staging = tempfile.mkdtemp(prefix="free-configs-test-")
+    sentinel = "#header\nvless://PREEXISTING\n"
+    with open(os.path.join(staging, "configs.txt"), "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(sentinel)
+    environment = dict(os.environ)
+    environment.pop("SOURCE_URL", None)
+    environment.update(
+        SOURCE_URLS=source_urls,
+        OUTPUT_DIR=staging,
+        SKIP_HEALTHCHECK="1",
+        PYTHONIOENCODING="utf-8",
+    )
+    completed = subprocess.run(
+        [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "build.py")],
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=180,
+    )
+    with open(os.path.join(staging, "configs.txt"), encoding="utf-8") as fh:
+        produced = fh.read()
+    shutil.rmtree(staging, ignore_errors=True)
+    return completed, produced == sentinel, produced
+
+
+GOOD_BODY = (
+    b"vless://22222222-2222-2222-2222-222222222222@9.9.9.9:2053"
+    b"?security=tls&type=ws&host=live.example&path=/#ok\n"
 )
-completed = subprocess.run(
-    [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "build.py")],
-    capture_output=True,
-    text=True,
-    env=environment,
-    timeout=180,
-)
-listener.close()
 
-with open(os.path.join(staging, "configs.txt"), encoding="utf-8") as handle:
-    still_there = handle.read() == sentinel
-
+# A source can return HTTP 200 and still be useless.
+completed, untouched, _ = run_build(serve(b"<html><body>404 Not Found</body></html>"))
 check(completed.returncode != 0, "build: an unusable source fails the run")
-check(still_there, "build: an unusable source leaves the previous configs.txt intact")
+check(untouched, "build: an unusable source leaves the previous configs.txt intact")
 check("Traceback" not in completed.stderr, "build: an unusable source reports, not crashes")
 # The message has to name the source as the problem. Reaching the generic
 # "not enough healthy nodes" path instead would send someone hunting for dead
@@ -406,7 +501,45 @@ check(
     "no usable configs parsed" in completed.stderr,
     "build: an unusable source is diagnosed as a source problem",
 )
-shutil.rmtree(staging, ignore_errors=True)
+
+# One dead source must not sink the others.
+completed, _, produced = run_build(
+    serve(GOOD_BODY) + "," + serve(b"gone", status="404 Not Found")
+)
+check(completed.returncode == 0, "sources: a dead source does not fail the build")
+check("live.example" in produced, "sources: the surviving source still publishes")
+check("unreachable source" in completed.stdout, "sources: the dead source is reported")
+
+# Every source dead is a different matter.
+completed, untouched, _ = run_build(
+    serve(b"gone", status="404 Not Found") + "," + serve(b"gone", status="410 Gone")
+)
+check(completed.returncode != 0, "sources: all sources dead fails the build")
+check(untouched, "sources: all sources dead leaves the previous configs.txt intact")
+
+# A base64 source is decoded, and duplicate lines across sources collapse.
+completed, _, produced = run_build(
+    serve(GOOD_BODY) + "," + serve(base64.b64encode(GOOD_BODY))
+)
+check(completed.returncode == 0, "sources: a base64 source is accepted")
+# One input node listed by both sources must yield exactly two output nodes --
+# itself and its rule 9 mirror -- not four.
+emitted = [l for l in produced.splitlines() if l and not l.startswith("#")]
+check(len(emitted) == 2, "sources: the same node from two sources is deduped")
+# Node-level dedup would collapse these anyway, so assert the line-level pass
+# actually ran -- it is what keeps a large overlapping source from being
+# parsed twice.
+check(
+    "1 parsed as" in completed.stdout and "from 1 unique lines" in completed.stdout,
+    "sources: a duplicate line is dropped before parsing, not parsed twice",
+)
+check(
+    sorted(parse_line(l).port for l in emitted) == ["443", "8080"],
+    "sources: the deduped node still gains its mirror",
+)
+
+for sock in SERVERS:
+    sock.close()
 
 # --- report ----------------------------------------------------------------
 

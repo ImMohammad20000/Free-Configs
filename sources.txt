@@ -1,0 +1,18 @@
+# Where the node lists come from. One URL per line.
+#
+# To change the source: edit the line below.
+# To add a source:      add another line.
+# To disable a source:  put a # in front of it, or delete the line.
+#
+# Commit the change and the next scheduled run picks it up -- no code edit,
+# and nothing else to keep in sync.
+#
+# Both plain-text and base64-encoded subscription lists work; the format is
+# detected automatically. Sources are merged and deduplicated, then every node
+# goes through the same rules and the same health check, so adding a low-quality
+# source costs build time but cannot put a dead node in configs.txt.
+#
+# If one source is unreachable the build continues with the rest and says so.
+# It only fails if every source is unreachable.
+
+https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/verified/configs.txt

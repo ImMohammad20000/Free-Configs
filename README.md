@@ -46,10 +46,38 @@ than a precise clock.
 
 `scripts/build.py` runs four stages:
 
-1. **Fetch** the upstream list (`SOURCE_URL`).
+1. **Fetch** every list in [`sources.txt`](sources.txt).
 2. **Transform** — rules 1-13, in [`scripts/transform.py`](scripts/transform.py).
 3. **Health-check** — rule 14, in [`scripts/healthcheck.py`](scripts/healthcheck.py).
 4. **Publish** — write `configs.txt` and `configs_base64.txt`, then commit.
+
+### Changing or adding sources
+
+Edit [`sources.txt`](sources.txt) — one URL per line, `#` for comments. Commit
+it and the next scheduled run picks it up; there is no code to touch and
+nothing else to keep in sync.
+
+```
+https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/verified/configs.txt
+https://example.com/another-subscription.txt
+```
+
+Plain-text and base64-encoded lists both work — the format is detected, so you
+do not have to care which one a URL serves. Sources are merged and duplicate
+lines dropped before the rules run.
+
+Adding a low-quality source costs build time but cannot put a dead node in
+`configs.txt`: every node from every source goes through the same rules and the
+same health check. If one source is unreachable the build continues with the
+rest and says so; it only fails if *every* source is unreachable. A URL that is
+simply wrong (404, 410, 403) is not retried, so a stale entry costs one request
+rather than four.
+
+For a one-off run against different sources without editing the file:
+
+```bash
+SOURCE_URLS="https://a.example/list.txt,https://b.example/list.txt" python scripts/build.py
+```
 
 ### Rules 1-13
 
@@ -175,7 +203,7 @@ XRAY_BIN=/path/to/xray python scripts/build.py
 
 | Variable | Meaning |
 |---|---|
-| `SOURCE_URL` | upstream list to start from |
+| `SOURCE_URLS` | one or more URLs, comma- or whitespace-separated, overriding `sources.txt` (`SOURCE_URL` also accepted) |
 | `XRAY_BIN` | path to the Xray-core binary (default: `PATH`, then `bin/xray`) |
 | `OUTPUT_DIR` | where `configs.txt` is written (default: repository root) |
 | `SKIP_HEALTHCHECK` | `1` skips rule 14 |

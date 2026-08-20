@@ -2,8 +2,12 @@
 
     python scripts/build.py
 
+Sources come from sources.txt in the repository root, one URL per line. Both
+plain-text and base64-encoded subscription lists work; the format is detected.
+
 Environment overrides:
-    SOURCE_URL        upstream list to start from
+    SOURCE_URLS       one or more URLs (comma- or whitespace-separated),
+                      overriding sources.txt. SOURCE_URL is accepted too.
     XRAY_BIN          path to the Xray-core binary (default: search PATH, then bin/xray)
     OUTPUT_DIR        where configs.txt is written (default: repository root)
     SKIP_HEALTHCHECK  set to 1 to skip rule 14, for local dry runs
@@ -13,6 +17,7 @@ Environment overrides:
 from __future__ import annotations
 
 import base64
+import binascii
 import http.client
 import os
 import shutil
@@ -28,11 +33,14 @@ import healthcheck  # noqa: E402
 import transform  # noqa: E402
 from nodes import parse_line  # noqa: E402
 
-SOURCE_URL = os.environ.get(
-    "SOURCE_URL",
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Change or add sources by editing sources.txt -- one URL per line, no code
+# change needed. Used only if that file is missing or has no usable lines.
+SOURCES_FILE = os.path.join(REPO_ROOT, "sources.txt")
+DEFAULT_SOURCES = (
     "https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/verified/configs.txt",
 )
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", REPO_ROOT)
 OUTPUT_FILE = "configs.txt"
 OUTPUT_FILE_BASE64 = "configs_base64.txt"
@@ -57,6 +65,78 @@ RETRYABLE_FETCH_ERRORS = (urllib.error.URLError, OSError, http.client.HTTPExcept
 MIN_HEALTHY_NODES = 1
 
 
+def is_permanent_http_error(error: BaseException) -> bool:
+    """True for a client error that will not change on a retry. 408 and 429 are
+    excluded: those explicitly mean "try again"."""
+    return (
+        isinstance(error, urllib.error.HTTPError)
+        and 400 <= error.code < 500
+        and error.code not in (408, 429)
+    )
+
+
+def load_sources() -> list[str]:
+    """Where the upstream lists come from, in order of precedence:
+    the SOURCE_URLS/SOURCE_URL environment variables, then sources.txt, then
+    the built-in default."""
+    from_env = os.environ.get("SOURCE_URLS") or os.environ.get("SOURCE_URL")
+    if from_env:
+        # Accept commas, whitespace or newlines as separators.
+        urls = [u.strip() for u in from_env.replace(",", "\n").split() if u.strip()]
+        if urls:
+            return urls
+
+    if os.path.exists(SOURCES_FILE):
+        with open(SOURCES_FILE, encoding="utf-8") as handle:
+            urls = [
+                line.strip()
+                for line in handle
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+        if urls:
+            return urls
+
+    return list(DEFAULT_SOURCES)
+
+
+def decode_if_base64(text: str) -> str:
+    """Many subscription URLs serve the list base64-encoded. Detect that and
+    decode, so adding a source does not mean caring which form it uses."""
+    if "://" in text[:4096]:
+        return text
+    compact = "".join(text.split())
+    if not compact:
+        return text
+    try:
+        decoded = base64.b64decode(compact + "=" * (-len(compact) % 4), validate=False)
+    except (ValueError, binascii.Error):
+        return text
+    candidate = decoded.decode("utf-8", "replace")
+    return candidate if "://" in candidate else text
+
+
+def fetch_all(urls: list[str]) -> tuple[list[str], list[str]]:
+    """Fetch every source and return (lines, failed_urls).
+
+    A source that fails does not sink the build -- the others still publish --
+    but it is reported, and main() stops if every source failed.
+    """
+    lines: list[str] = []
+    failed: list[str] = []
+    for url in urls:
+        try:
+            body = decode_if_base64(fetch(url))
+        except SystemExit as error:
+            print(f"  ! {url}: {error}")
+            failed.append(url)
+            continue
+        found = body.splitlines()
+        usable = sum(1 for line in found if parse_line(line) is not None)
+        print(f"  {url}\n      {len(found)} lines, {usable} usable configs")
+        lines.extend(found)
+    return lines, failed
+
+
 def fetch(url: str) -> str:
     last_error: Exception | None = None
     for attempt in range(1, FETCH_ATTEMPTS + 1):
@@ -67,6 +147,10 @@ def fetch(url: str) -> str:
             with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT) as response:
                 return response.read().decode("utf-8", "replace")
         except RETRYABLE_FETCH_ERRORS as error:
+            if is_permanent_http_error(error):
+                # A wrong or removed URL will answer the same way every time;
+                # retrying it just delays the other sources.
+                raise SystemExit(f"could not fetch {url}: {error}") from None
             last_error = error
             print(f"  fetch attempt {attempt}/{FETCH_ATTEMPTS} failed: {error}")
             if attempt < FETCH_ATTEMPTS:
@@ -103,7 +187,7 @@ def existing_links(path: str) -> list[str]:
         return [line.strip() for line in handle if line.strip() and not line.startswith("#")]
 
 
-def render(links: list[str], counts: dict) -> str:
+def render(links: list[str], counts: dict, sources: list[str]) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     header = [
         f"#profile-title: {PROFILE_TITLE}",
@@ -112,7 +196,8 @@ def render(links: list[str], counts: dict) -> str:
         f"# {len(links)} nodes"
         f" ({counts.get('final_443', 0)} on 443, {counts.get('final_8080', 0)} on 8080"
         " before health check)",
-        f"# generated {stamp} from {SOURCE_URL}",
+        f"# generated {stamp} from {len(sources)} source(s):",
+        *(f"#   {url}" for url in sources),
         f"# criterion: a real proxied request to https://{healthcheck.TEST_HOST}"
         f"{healthcheck.TEST_PATH} succeeded in all"
         f" {counts.get('rounds', healthcheck.ROUNDS)} independent runs",
@@ -128,25 +213,43 @@ def render(links: list[str], counts: dict) -> str:
 def main() -> int:
     counts: dict = {}
 
-    print(f"Fetching {SOURCE_URL}")
-    raw = fetch(SOURCE_URL)
-    lines = raw.splitlines()
-    print(f"  {len(lines)} lines")
+    sources = load_sources()
+    print(f"Fetching {len(sources)} source(s)")
+    lines, failed = fetch_all(sources)
+    counts["sources"] = len(sources)
+    counts["sources_failed"] = len(failed)
 
+    if failed and len(failed) == len(sources):
+        print(
+            f"ERROR: every source failed ({len(failed)}/{len(sources)});"
+            f" leaving {OUTPUT_FILE} untouched",
+            file=sys.stderr,
+        )
+        return 1
+    if failed:
+        print(f"  ! continuing without {len(failed)} unreachable source(s)")
+
+    # Sources overlap, so drop repeated lines before parsing. Node-level dedup
+    # still happens after the rules run, once addresses have been rewritten.
+    seen_lines: set[str] = set()
     nodes = []
     for line in lines:
-        node = parse_line(line)
+        stripped = line.strip()
+        if not stripped or stripped in seen_lines:
+            continue
+        seen_lines.add(stripped)
+        node = parse_line(stripped)
         if node is not None:
             nodes.append(node)
     counts["parsed"] = len(nodes)
-    print(f"  {len(nodes)} parsed as vless/trojan/vmess")
+    print(f"  {len(nodes)} parsed as vless/trojan/vmess from {len(seen_lines)} unique lines")
 
     if not nodes:
         # A 200 response can still be the wrong thing -- an error page, or a
         # source that changed format. Say so now rather than after a health
         # check that had nothing to test.
         print(
-            f"ERROR: no usable configs parsed from {SOURCE_URL};"
+            f"ERROR: no usable configs parsed from {len(sources)} source(s);"
             f" leaving {OUTPUT_FILE} untouched",
             file=sys.stderr,
         )
@@ -220,7 +323,7 @@ def main() -> int:
         return 0
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    document = render(links, counts)
+    document = render(links, counts, sources)
     with open(output_path, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(document)
     with open(base64_path, "w", encoding="ascii", newline="\n") as handle:
