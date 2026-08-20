@@ -284,6 +284,65 @@ check(node is not None and node.host == "a.example", "vmess: host")
 check(transform.INCLUDE_VMESS is False, "vmess: excluded by default (cannot carry fm/cs)")
 check(len(transform.transform([parse_line(VMESS)], {})) == 0, "vmess: dropped by the transform")
 
+# vmess serialisation is only reachable when INCLUDE_VMESS is turned on, but a
+# toggle nobody exercises is a toggle that breaks silently. These also verify
+# the reason it is off: a vmess link genuinely cannot carry fm or cs.
+
+VMESS_FULL = "vmess://" + base64.b64encode(json.dumps({
+    "v": "2", "ps": "original name", "add": "9.9.9.9", "port": "2053",
+    "id": "33333333-3333-3333-3333-333333333333", "aid": "0", "scy": "aes-128-gcm",
+    "net": "ws", "type": "none", "host": "vm.example", "path": "/vm",
+    "tls": "tls", "sni": "vm.example", "alpn": "", "fp": "chrome",
+}).encode()).decode()
+
+vm = parse_line(VMESS_FULL)
+check(vm is not None, "vmess: a full link parses")
+again = parse_line(vm.to_link())
+check(again is not None, "vmess: re-parses after serialisation")
+for field in ("scheme", "uid", "address", "port", "tag"):
+    check(getattr(again, field) == getattr(vm, field), f"vmess: {field} survives a round trip")
+for key in ("type", "security", "host", "path", "sni", "headerType"):
+    check(again.get(key) == vm.get(key), f"vmess: {key} survives a round trip")
+check(again.extra.get("scy") == "aes-128-gcm", "vmess: the cipher survives a round trip")
+
+outbound = vm.to_outbound("t")
+user = outbound["settings"]["vnext"][0]["users"][0]
+check(outbound["protocol"] == "vmess", "vmess: outbound protocol")
+check(user["alterId"] == 0 and user["security"] == "aes-128-gcm",
+      "vmess: alterId and cipher reach the outbound")
+check(outbound["streamSettings"]["network"] == "ws", "vmess: net maps to the stream network")
+
+real_include = transform.INCLUDE_VMESS
+try:
+    transform.INCLUDE_VMESS = True
+    vm_out = transform.transform([parse_line(VMESS_FULL)], {})
+    check(len(vm_out) == 2, "vmess: with the toggle on it survives and gains its mirror")
+    vm443 = next(n for n in vm_out if n.port == "443")
+    vm8080 = next(n for n in vm_out if n.port == "8080")
+    check(vm443.address == transform.ADDRESS_FOR_PORT_443 and vm443.security == "tls",
+          "vmess: rules 8 and 10 apply to a vmess node")
+    check(vm8080.security == "none" and not vm8080.get("sni"),
+          "vmess: rule 9 mirrors a vmess node to plaintext")
+    check(vm443.get("fm") == transform.FM_443 and vm443.get("cs") == transform.CS_443,
+          "vmess: rule 12 sets fm and cs on the node")
+
+    # The documented limitation, verified rather than assumed: the vmess wire
+    # format has a fixed key set with nowhere to put fm or cs, so they are
+    # silently lost on serialisation. That is why the toggle defaults to off.
+    payload = json.loads(base64.b64decode(
+        vm443.to_link().split("://", 1)[1] + "=="
+    ).decode("utf-8", "replace"))
+    check("fm" not in payload and "cs" not in payload,
+          "vmess: the wire format has nowhere to carry fm or cs")
+    check(transform.FM_443_ENCODED not in vm443.to_link(),
+          "vmess: fm really is absent from the emitted link")
+    check(payload["tls"] == "tls" and payload["sni"] == "vm.example",
+          "vmess: what the format can carry is still carried")
+    check(payload["add"] == transform.ADDRESS_FOR_PORT_443 and payload["port"] == "443",
+          "vmess: the rewritten address and port reach the wire format")
+finally:
+    transform.INCLUDE_VMESS = real_include
+
 # --- masking constants round trip ------------------------------------------
 
 for name, encoded, decoded in (
