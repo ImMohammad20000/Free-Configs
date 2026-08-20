@@ -1,7 +1,6 @@
 # configs.txt is written with LF by build.py. Without this, a Windows checkout
 # converts it to CRLF and the next local run shows the whole file as changed.
-configs.txt        text eol=lf
-configs_base64.txt text eol=lf
-*.py               text eol=lf
-*.yml              text eol=lf
-*.md               text eol=lf
+*.txt text eol=lf
+*.py  text eol=lf
+*.yml text eol=lf
+*.md  text eol=lf
