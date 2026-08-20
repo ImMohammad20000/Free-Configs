@@ -13,6 +13,7 @@ Environment overrides:
 from __future__ import annotations
 
 import base64
+import http.client
 import os
 import shutil
 import sys
@@ -44,6 +45,12 @@ UPDATE_INTERVAL_DAYS = 1
 FETCH_ATTEMPTS = 4
 FETCH_TIMEOUT = 45
 
+# Transient fetch failures worth another attempt. http.client.HTTPException is
+# here for IncompleteRead and BadStatusLine, which are not OSError subclasses:
+# a truncated response is the most likely partial-data failure, and without it
+# the retry loop is bypassed and the error escapes as a traceback.
+RETRYABLE_FETCH_ERRORS = (urllib.error.URLError, OSError, http.client.HTTPException)
+
 # An unattended daily job must never publish an empty subscription: if a run
 # yields fewer than this, the previous configs.txt is left in place and the
 # workflow fails loudly instead.
@@ -59,7 +66,7 @@ def fetch(url: str) -> str:
             )
             with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT) as response:
                 return response.read().decode("utf-8", "replace")
-        except (urllib.error.URLError, TimeoutError, OSError) as error:
+        except RETRYABLE_FETCH_ERRORS as error:
             last_error = error
             print(f"  fetch attempt {attempt}/{FETCH_ATTEMPTS} failed: {error}")
             if attempt < FETCH_ATTEMPTS:
@@ -133,6 +140,17 @@ def main() -> int:
             nodes.append(node)
     counts["parsed"] = len(nodes)
     print(f"  {len(nodes)} parsed as vless/trojan/vmess")
+
+    if not nodes:
+        # A 200 response can still be the wrong thing -- an error page, or a
+        # source that changed format. Say so now rather than after a health
+        # check that had nothing to test.
+        print(
+            f"ERROR: no usable configs parsed from {SOURCE_URL};"
+            f" leaving {OUTPUT_FILE} untouched",
+            file=sys.stderr,
+        )
+        return 1
 
     print("Applying rules 1-13")
     transformed = transform.transform(nodes, counts)

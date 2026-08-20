@@ -9,6 +9,7 @@ test named after it, plus parser edge cases and end-to-end properties.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from urllib.parse import quote
 
@@ -309,6 +310,103 @@ for node in grpc:
         outbound["streamSettings"]["grpcSettings"]["authority"] == "a.example",
         "outbound: grpc authority comes from host",
     )
+
+# --- fetch retry coverage --------------------------------------------------
+# A truncated response raises IncompleteRead, which is an HTTPException and NOT
+# an OSError, so a handler catching only OSError silently skips the retry and
+# lets the error escape as a traceback.
+
+import http.client  # noqa: E402
+import urllib.error  # noqa: E402
+
+import build  # noqa: E402
+
+for exc in (
+    http.client.IncompleteRead,
+    http.client.BadStatusLine,
+    http.client.RemoteDisconnected,
+    urllib.error.URLError,
+    urllib.error.HTTPError,
+    TimeoutError,
+    ConnectionResetError,
+):
+    check(
+        issubclass(exc, build.RETRYABLE_FETCH_ERRORS),
+        f"fetch: {exc.__name__} is retried rather than fatal",
+    )
+
+# --- refusing to publish rubbish -------------------------------------------
+# A source can return HTTP 200 and still be useless (an error page, or a
+# changed format). build.py must fail and leave the previous configs.txt alone
+# rather than publishing an empty subscription. Served from loopback so the
+# test stays offline.
+
+import socket  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+import threading  # noqa: E402
+
+
+def _serve_once(sock: socket.socket, body: bytes) -> None:
+    try:
+        conn, _ = sock.accept()
+    except OSError:
+        return
+    with conn:
+        try:
+            conn.recv(4096)
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body)
+                + body
+            )
+        except OSError:
+            pass
+
+
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.bind(("127.0.0.1", 0))
+listener.listen(1)
+listener.settimeout(30)
+served_port = listener.getsockname()[1]
+threading.Thread(
+    target=_serve_once, args=(listener, b"<html><body>404 Not Found</body></html>"), daemon=True
+).start()
+
+staging = tempfile.mkdtemp(prefix="free-configs-test-")
+sentinel = "#header\nvless://PREEXISTING\n"
+with open(os.path.join(staging, "configs.txt"), "w", encoding="utf-8", newline="\n") as handle:
+    handle.write(sentinel)
+
+environment = dict(os.environ)
+environment.update(
+    SOURCE_URL=f"http://127.0.0.1:{served_port}/list.txt",
+    OUTPUT_DIR=staging,
+    SKIP_HEALTHCHECK="1",
+    PYTHONIOENCODING="utf-8",
+)
+completed = subprocess.run(
+    [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "build.py")],
+    capture_output=True,
+    text=True,
+    env=environment,
+    timeout=180,
+)
+listener.close()
+
+with open(os.path.join(staging, "configs.txt"), encoding="utf-8") as handle:
+    still_there = handle.read() == sentinel
+
+check(completed.returncode != 0, "build: an unusable source fails the run")
+check(still_there, "build: an unusable source leaves the previous configs.txt intact")
+check("Traceback" not in completed.stderr, "build: an unusable source reports, not crashes")
+# The message has to name the source as the problem. Reaching the generic
+# "not enough healthy nodes" path instead would send someone hunting for dead
+# proxies when the real fault is upstream returning something unusable.
+check(
+    "no usable configs parsed" in completed.stderr,
+    "build: an unusable source is diagnosed as a source problem",
+)
+shutil.rmtree(staging, ignore_errors=True)
 
 # --- report ----------------------------------------------------------------
 
