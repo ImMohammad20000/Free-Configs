@@ -183,7 +183,12 @@ def preflight(xray: str) -> list[str]:
 
 def preflight_probes() -> list[tuple[str, Node]]:
     """The two configurations the pipeline actually emits: a TLS node carrying
-    the full masking set, and a plaintext node on the public exit address."""
+    the full masking set, and a plaintext node on the public exit address.
+
+    The addresses come from transform's rule 10 constants rather than being
+    written out again here, so repointing either exit address repoints what the
+    preflight tests along with it.
+    """
     blank_uuid = "00000000-0000-0000-0000-000000000000"
     return [
         (
@@ -191,7 +196,7 @@ def preflight_probes() -> list[tuple[str, Node]]:
             Node(
                 scheme="vless",
                 uid=blank_uuid,
-                address="188.114.97.6",
+                address=transform.ADDRESS_FOR_PORT_443,
                 port="443",
                 params={
                     "encryption": "none",
@@ -211,7 +216,7 @@ def preflight_probes() -> list[tuple[str, Node]]:
             Node(
                 scheme="vless",
                 uid=blank_uuid,
-                address="188.114.97.6",
+                address=transform.ADDRESS_FOR_PORT_8080,
                 port="8080",
                 params={
                     "encryption": "none",

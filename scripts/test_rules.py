@@ -9,7 +9,9 @@ test named after it, plus parser edge cases and end-to-end properties.
 from __future__ import annotations
 
 import base64
+import contextlib
 import http.client
+import io
 import json
 import os
 import shutil
@@ -390,6 +392,118 @@ try:
     check(len(ok) == 2, "healthcheck: an unrenderable node does not take the batch with it")
 finally:
     healthcheck._config_accepted = real_accepted
+
+# _run_batch maps each node to its own loopback port and each result back to
+# that node. An off-by-one here would not fail loudly -- it would quietly
+# credit one node with another's result and publish the wrong ones.
+class _FakeProcess:
+    def poll(self):
+        return None
+
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        pass
+
+
+probed_ports: list[int] = []
+real_popen = healthcheck.subprocess.Popen
+real_wait = healthcheck._wait_until_listening
+real_probe = healthcheck._probe
+try:
+    healthcheck.subprocess.Popen = lambda *a, **k: _FakeProcess()
+    healthcheck._wait_until_listening = lambda ports, deadline, process=None: True
+    # Latency encodes the port, so a mis-mapped result is visible in the output.
+    def _record(port):
+        probed_ports.append(port)
+        return (port % 2 == 0, float(port))
+
+    healthcheck._probe = _record
+    mapped = healthcheck._run_batch("xray", scored_batch := [n for n in one(**BASE)] * 3,
+                                    tempfile.gettempdir(), "unit")
+finally:
+    healthcheck.subprocess.Popen = real_popen
+    healthcheck._wait_until_listening = real_wait
+    healthcheck._probe = real_probe
+
+expected_ports = list(range(healthcheck.BASE_PORT, healthcheck.BASE_PORT + len(scored_batch)))
+check(sorted(probed_ports) == expected_ports,
+      "healthcheck: each node in a batch is probed on its own port, once")
+check(
+    all(latency == float(healthcheck.BASE_PORT + index) for index, latency in mapped.items()),
+    "healthcheck: a probe result is credited to the node it came from",
+)
+check(
+    set(mapped) == {i for i in range(len(scored_batch))
+                    if (healthcheck.BASE_PORT + i) % 2 == 0},
+    "healthcheck: only the nodes that passed appear in the result",
+)
+
+
+# check() decides what is published. A node must pass EVERY round: passing
+# some rounds is what "flaky" means, and publishing those is the mistake the
+# three-round design exists to avoid.
+scored = [n for i in range(5) for n in one(**{**BASE, "host": f"n{i}.example"})][:5]
+for index, node in enumerate(scored):
+    node.tag = f"node-{index}"
+
+# node-0 and node-4 pass all three rounds; node-1 passes two; node-2 passes
+# one; node-3 never passes.
+# node-0's latencies are chosen so the median and the final round disagree on
+# the ordering: by median it is slower than node-4, by last round it is faster.
+ROUND_RESULTS = [
+    {0: 300.0, 1: 10.0, 4: 50.0},
+    {0: 100.0, 1: 10.0, 4: 50.0},
+    {0: 20.0, 2: 10.0, 4: 50.0},
+]
+rounds_seen: list[str] = []
+
+real_validate = healthcheck.validate_nodes
+real_run_batch = healthcheck._run_batch
+real_pause = healthcheck.PAUSE_BETWEEN_ROUNDS
+try:
+    healthcheck.validate_nodes = lambda xray, nodes, directory: (list(nodes), [])
+    healthcheck.PAUSE_BETWEEN_ROUNDS = 0
+
+    def _stub_run_batch(xray, batch, directory, label):
+        rounds_seen.append(label)
+        return ROUND_RESULTS[len(rounds_seen) - 1]
+
+    healthcheck._run_batch = _stub_run_batch
+    stats: dict = {}
+    # check() narrates its rounds; that belongs in a build log, not here.
+    with contextlib.redirect_stdout(io.StringIO()):
+        healthy = healthcheck.check("xray", scored, stats, rounds=3)
+
+    survivors = [n.tag for n in healthy]
+    check(survivors == ["node-4", "node-0"],
+          "healthcheck: only nodes passing every round survive, fastest median first")
+    check("node-1" not in survivors and "node-2" not in survivors,
+          "healthcheck: a node passing some rounds is not published")
+    check("node-3" not in survivors, "healthcheck: a node passing no round is not published")
+    check(stats["healthy"] == 2, "healthcheck: the healthy count is recorded")
+    check([stats[f"round_{i}_passed"] for i in (1, 2, 3)] == [3, 3, 3],
+          "healthcheck: per-round pass counts are recorded")
+    # 4 nodes worked at least once, 2 worked every time.
+    check(stats["flaky_percent"] == 50.0, "healthcheck: flakiness is measured, not guessed")
+    check(healthy[0].latency_ms == 50 and healthy[1].latency_ms == 100,
+          "healthcheck: the published latency is the median across rounds")
+    check(len(rounds_seen) == 3, "healthcheck: it really runs the requested number of rounds")
+
+    # No nodes at all must not explode.
+    empty_stats: dict = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        empty_result = healthcheck.check("xray", [], empty_stats)
+    check(empty_result == [] and empty_stats["healthy"] == 0,
+          "healthcheck: an empty node list is handled")
+finally:
+    healthcheck.validate_nodes = real_validate
+    healthcheck._run_batch = real_run_batch
+    healthcheck.PAUSE_BETWEEN_ROUNDS = real_pause
 
 # The preflight has to exercise both shapes the pipeline emits, or it proves
 # nothing about the core it is about to trust.
