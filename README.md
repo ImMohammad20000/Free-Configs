@@ -16,7 +16,16 @@ Base64, for clients that require it:
 https://raw.githubusercontent.com/patterniha/Free-Configs/main/configs_base64.txt
 ```
 
-Rebuilt every 24 hours by [`.github/workflows/build.yml`](.github/workflows/build.yml).
+Rebuilt every 24 hours by [`.github/workflows/build.yml`](.github/workflows/build.yml),
+on a `schedule:` cron — no manual step is involved. GitHub queues scheduled runs
+and can delay or skip them under load, so treat it as "about once a day" rather
+than a precise clock.
+
+> One operational caveat: GitHub disables scheduled workflows in a repository
+> that has had **no new commits for 60 days**, and emails the owner. This
+> workflow commits whenever the healthy set changes, which resets that timer, so
+> it only becomes a risk if the published list is byte-identical (or the build
+> fails) for 60 consecutive days.
 
 > **Client requirement:** use [patterniha/Xray-core](https://github.com/patterniha/Xray-core),
 > not the upstream core. Two reasons:
@@ -171,6 +180,27 @@ XRAY_BIN=/path/to/xray python scripts/build.py
 | `OUTPUT_DIR` | where `configs.txt` is written (default: repository root) |
 | `SKIP_HEALTHCHECK` | `1` skips rule 14 |
 | `HEALTHCHECK_ROUNDS` | rounds a node must pass (default 3) |
+
+## Tests
+
+```bash
+python scripts/test_rules.py
+```
+
+[`scripts/test_rules.py`](scripts/test_rules.py) covers every numbered rule,
+the parser's edge cases (bracketed IPv6, userinfo containing `@` and `:`,
+encoded `=` inside a value, missing fragment, malformed input), deduplication,
+and the rendered Xray outbound. It needs no test framework and runs in the
+workflow before anything else, so a broken rule fails the build instead of
+publishing bad configs.
+
+The suite was checked by mutation testing — deliberately breaking each rule in a
+copy of the source and confirming the tests fail. That found two blind spots
+worth knowing about, both now covered: rule 13 strips `sni` from plaintext nodes
+anyway, so going through `transform()` cannot prove rule 9 removes it (there is
+now a test calling `rule_9_mirror` directly), and the TLS-only stripping is only
+exercised by a source node that *arrives* carrying `alpn`/`fp`/`cs`, not by a
+mirrored one.
 
 ### A note on testing from a censored network
 

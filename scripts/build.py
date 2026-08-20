@@ -196,7 +196,8 @@ def main() -> int:
     # Compared as a set, not a list: the health check orders by measured
     # latency, which drifts run to run, so an order-sensitive comparison would
     # rewrite the file and commit every day even when nothing actually changed.
-    if set(links) == set(existing_links(output_path)):
+    # The base64 file must exist too, or a deleted one would never come back.
+    if set(links) == set(existing_links(output_path)) and os.path.exists(base64_path):
         print(f"{OUTPUT_FILE} already up to date ({len(links)} nodes); not rewriting")
         return 0
 

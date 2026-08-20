@@ -21,10 +21,17 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history: the push-retry below rebases onto origin, and a
+          # depth-1 clone has no merge base for that to work against.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Test the transform rules
+        run: python scripts/test_rules.py
 
       - name: Install newest Xray-core
         env:
@@ -96,11 +103,14 @@ jobs:
           nodes="$(grep -cv '^#' configs.txt || true)"
           git commit -m "Update configs (${nodes:-0} nodes)"
           for attempt in 1 2 3; do
-            if git push; then
+            # Explicit refspec: does not rely on the checkout having configured
+            # an upstream for the local branch.
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
               exit 0
             fi
-            echo "push failed (attempt ${attempt}); rebasing on origin"
-            git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+            echo "push failed (attempt ${attempt}); rebasing onto origin"
+            git fetch origin "${GITHUB_REF_NAME}"
+            git rebase "origin/${GITHUB_REF_NAME}"
           done
           echo "could not push after 3 attempts" >&2
           exit 1
