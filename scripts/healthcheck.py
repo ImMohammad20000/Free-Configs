@@ -309,7 +309,7 @@ def check(
     xray: str, nodes: list[Node], stats: dict | None = None, rounds: int = ROUNDS
 ) -> list[Node]:
     """Return the nodes that passed a real proxied request in every round,
-    sorted by median latency so an unchanged network yields an unchanged file."""
+    ordered fastest-first by median latency across the rounds."""
     counts: dict = stats if stats is not None else {}
     if not nodes:
         counts["healthy"] = 0

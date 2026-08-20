@@ -38,7 +38,8 @@ OUTPUT_FILE_BASE64 = "configs_base64.txt"
 
 PROFILE_TITLE = "Free-Configs"
 PROFILE_PAGE = "https://github.com/patterniha/Free-Configs"
-UPDATE_INTERVAL_HOURS = 24
+# How often a client should re-fetch, in days, matching the workflow's cadence.
+UPDATE_INTERVAL_DAYS = 1
 
 FETCH_ATTEMPTS = 4
 FETCH_TIMEOUT = 45
@@ -99,7 +100,7 @@ def render(links: list[str], counts: dict) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     header = [
         f"#profile-title: {PROFILE_TITLE}",
-        f"#profile-update-interval: {UPDATE_INTERVAL_HOURS // 24}",
+        f"#profile-update-interval: {UPDATE_INTERVAL_DAYS}",
         f"#profile-web-page-url: {PROFILE_PAGE}",
         f"# {len(links)} nodes"
         f" ({counts.get('final_443', 0)} on 443, {counts.get('final_8080', 0)} on 8080"
