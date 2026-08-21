@@ -17,3 +17,4 @@
 
 https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/verified/configs.txt
 https://raw.githubusercontent.com/itsyebekhe/PSG/main/subscriptions/xray/mix
+https://github.com/Delta-Kronecker/V2ray-Config/raw/refs/heads/main/config/all_configs.txt

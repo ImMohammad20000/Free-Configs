@@ -71,8 +71,13 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrom
 
 ROUNDS = 3                 # a node must pass every round
 REQUEST_TIMEOUT = 5.0      # seconds, matches upstream's 5000ms budget
-BATCH_SIZE = 32            # nodes per Xray process
-PROBE_WORKERS = 32         # concurrent probes within a batch
+# Measured on 192 nodes: 32/32 took 52s, 64/64 took 38s, 96/96 took 36s, and
+# 96 reproduced every pass 32 found. Fewer, larger batches win because the
+# fixed cost is starting and stopping Xray, not the probing, which is
+# concurrent and I/O-bound. The pool grows as sources are added, so this is
+# what keeps the run inside the workflow timeout.
+BATCH_SIZE = 96            # nodes per Xray process
+PROBE_WORKERS = 96         # concurrent probes within a batch
 BASE_PORT = 21080          # first loopback inbound port
 STARTUP_TIMEOUT = 15.0     # seconds to wait for Xray to bind its inbounds
 SHUTDOWN_TIMEOUT = 5.0

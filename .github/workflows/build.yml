@@ -18,7 +18,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Health-check cost scales with the node pool, which grows as sources are
+    # added: run 3 spent 780s on 1495 nodes. Headroom for that to keep growing.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
