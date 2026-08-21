@@ -470,6 +470,7 @@ class _FakeProcess:
 
 
 probed_ports: list[int] = []
+probed_endpoints: list[str] = []
 real_popen = healthcheck.subprocess.Popen
 real_wait = healthcheck._wait_until_listening
 real_probe = healthcheck._probe
@@ -477,13 +478,15 @@ try:
     healthcheck.subprocess.Popen = lambda *a, **k: _FakeProcess()
     healthcheck._wait_until_listening = lambda ports, deadline, process=None: True
     # Latency encodes the port, so a mis-mapped result is visible in the output.
-    def _record(port):
+    def _record(port, endpoint):
         probed_ports.append(port)
+        probed_endpoints.append(endpoint.host)
         return (port % 2 == 0, float(port))
 
     healthcheck._probe = _record
     mapped = healthcheck._run_batch("xray", scored_batch := [n for n in one(**BASE)] * 3,
-                                    tempfile.gettempdir(), "unit")
+                                    tempfile.gettempdir(), "unit",
+                                    healthcheck.TEST_ENDPOINTS[0])
 finally:
     healthcheck.subprocess.Popen = real_popen
     healthcheck._wait_until_listening = real_wait
@@ -501,6 +504,8 @@ check(
                     if (healthcheck.BASE_PORT + i) % 2 == 0},
     "healthcheck: only the nodes that passed appear in the result",
 )
+check(set(probed_endpoints) == {healthcheck.TEST_ENDPOINTS[0].host},
+      "healthcheck: every node in a batch is measured against the same endpoint")
 
 
 # check() decides what is published. A node must pass EVERY round: passing
@@ -524,12 +529,14 @@ rounds_seen: list[str] = []
 real_validate = healthcheck.validate_nodes
 real_run_batch = healthcheck._run_batch
 real_pause = healthcheck.PAUSE_BETWEEN_ROUNDS
+real_usable_endpoints = healthcheck.usable_endpoints
 try:
     healthcheck.validate_nodes = lambda xray, nodes, directory: (list(nodes), [])
     healthcheck.PAUSE_BETWEEN_ROUNDS = 0
+    healthcheck.usable_endpoints = lambda: list(healthcheck.TEST_ENDPOINTS)
 
-    def _stub_run_batch(xray, batch, directory, label):
-        rounds_seen.append(label)
+    def _stub_run_batch(xray, batch, directory, label, endpoint):
+        rounds_seen.append(endpoint.host)
         return ROUND_RESULTS[len(rounds_seen) - 1]
 
     healthcheck._run_batch = _stub_run_batch
@@ -552,6 +559,10 @@ try:
     check(healthy[0].latency_ms == 50 and healthy[1].latency_ms == 100,
           "healthcheck: the published latency is the median across rounds")
     check(len(rounds_seen) == 3, "healthcheck: it really runs the requested number of rounds")
+    check(rounds_seen == [e.host for e in healthcheck.TEST_ENDPOINTS[:3]],
+          "healthcheck: each round uses a different endpoint, in order")
+    check(len({e.host for e in healthcheck.TEST_ENDPOINTS}) == len(healthcheck.TEST_ENDPOINTS),
+          "healthcheck: the endpoints are distinct hosts")
 
     # No nodes at all must not explode.
     empty_stats: dict = {}
@@ -563,6 +574,8 @@ finally:
     healthcheck.validate_nodes = real_validate
     healthcheck._run_batch = real_run_batch
     healthcheck.PAUSE_BETWEEN_ROUNDS = real_pause
+    # Leaving this stubbed would silently feed the endpoint tests below.
+    healthcheck.usable_endpoints = real_usable_endpoints
 
 # The preflight has to exercise both shapes the pipeline emits, or it proves
 # nothing about the core it is about to trust.
@@ -588,6 +601,83 @@ for _, node in probes:
     rendered = json.dumps(healthcheck._build_config([node], healthcheck.BASE_PORT))
     check("finalmask" in rendered, f"healthcheck: the port {node.port} probe renders a finalmask")
 
+
+# Endpoint selection and the pass/fail decision inside _probe. Both are stubbed
+# at the connection layer so the suite stays offline.
+class _FakeResponse:
+    def __init__(self, status):
+        self.status = status
+
+    def read(self):
+        return b""
+
+
+class _FakeHTTPS:
+    scripted: dict = {}
+
+    def __init__(self, host, port=None, timeout=None):
+        self._target = host
+
+    def set_tunnel(self, host, port):
+        self._target = host
+
+    def request(self, method, path, headers=None):
+        pass
+
+    def getresponse(self):
+        value = _FakeHTTPS.scripted.get(self._target, 599)
+        if isinstance(value, Exception):
+            raise value
+        return _FakeResponse(value)
+
+    def close(self):
+        pass
+
+
+CF, GS, AP = healthcheck.TEST_ENDPOINTS
+real_https = healthcheck.http.client.HTTPSConnection
+try:
+    healthcheck.http.client.HTTPSConnection = _FakeHTTPS
+    _FakeHTTPS.scripted = {
+        CF.host: 204,                        # healthy
+        GS.host: 500,                        # answers, but wrongly
+        AP.host: OSError("refused"),         # unreachable
+    }
+    with contextlib.redirect_stdout(io.StringIO()):
+        usable = healthcheck.usable_endpoints()
+    check([e.host for e in usable] == [CF.host],
+          "endpoints: only endpoints that actually answer correctly are used")
+
+    # A node's verdict follows the endpoint's own expected status, not a
+    # hardcoded 204 -- captive.apple.com answers 200 and that must count.
+    _FakeHTTPS.scripted = {CF.host: 204}
+    check(healthcheck._probe(1, CF)[0], "probe: the expected status passes")
+    _FakeHTTPS.scripted = {CF.host: 200}
+    check(not healthcheck._probe(1, CF)[0], "probe: a 200 does not pass a 204 endpoint")
+    _FakeHTTPS.scripted = {AP.host: 200}
+    check(healthcheck._probe(1, AP)[0], "probe: a 200 passes the endpoint that expects 200")
+    _FakeHTTPS.scripted = {AP.host: 204}
+    check(not healthcheck._probe(1, AP)[0], "probe: a 204 does not pass a 200 endpoint")
+    _FakeHTTPS.scripted = {CF.host: OSError("boom")}
+    ok, elapsed = healthcheck._probe(1, CF)
+    check(not ok and elapsed >= 0, "probe: a connection failure is a clean failure, not a crash")
+finally:
+    healthcheck.http.client.HTTPSConnection = real_https
+    _FakeHTTPS.scripted = {}
+
+# With every endpoint unusable there is nothing to measure, and the run must
+# say so rather than reporting that every node is dead.
+real_usable = healthcheck.usable_endpoints
+try:
+    healthcheck.usable_endpoints = lambda: []
+    raised = False
+    try:
+        healthcheck.check("xray", [n for n in one(**BASE)], {}, rounds=1)
+    except healthcheck.HealthCheckError:
+        raised = True
+    check(raised, "endpoints: no reachable endpoint aborts rather than failing every node")
+finally:
+    healthcheck.usable_endpoints = real_usable
 
 # --- fetch retry coverage --------------------------------------------------
 # A truncated response raises IncompleteRead, which is an HTTPException and NOT

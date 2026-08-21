@@ -14,6 +14,22 @@ fraction of nodes -- upstream measured 25-64% of working nodes as flaky.
 
 The default outbound is a blackhole, so a node whose routing rule somehow fails
 to match cannot fall through to a direct connection and report itself healthy.
+
+Two comparable projects were reviewed for ideas. Delta-Kronecker/V2ray-Config
+(src/validator.go) also runs a real proxied request, and its list of test URLs
+is where TEST_ENDPOINTS below comes from. itsyebekhe/PSG (main.py) does not
+proxy at all -- it checks DNS plus a TCP connect, which cannot tell a live
+proxy from any host with an open port.
+
+Three of their techniques are deliberately not used here:
+
+* A TCP-ping prefilter (both projects). Rule 10 points every node at the same
+  Cloudflare address, so a TCP connect always succeeds and filters nothing.
+* Retrying failed configs (Delta-Kronecker retries in rounds). That is the
+  opposite of requiring 3 of 3: a retry hands a flaky node extra chances to
+  pass, which is what the intersection exists to stop.
+* Static per-protocol field validation (PSG). Already covered -- xray run -test
+  validates every config first and the bisect isolates whatever it rejects.
 """
 
 from __future__ import annotations
@@ -27,13 +43,30 @@ import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import NamedTuple
 
 import transform
 from nodes import Node
 
-TEST_HOST = "cp.cloudflare.com"
-TEST_PATH = "/generate_204"
-EXPECTED_STATUS = 204
+
+class TestEndpoint(NamedTuple):
+    host: str
+    path: str
+    statuses: tuple[int, ...]
+
+
+# One endpoint per round, rotating, so a node has to satisfy three independent
+# operators rather than the same target three times. Testing only Cloudflare
+# would mean every node both exits through Cloudflare and is judged by it, and
+# a single endpoint being blocked or down would read as "every node is dead".
+# Borrowed from Delta-Kronecker/V2ray-Config, which tests against a list of
+# URLs; the per-round rotation is the adaptation that keeps the cost identical.
+TEST_ENDPOINTS: tuple[TestEndpoint, ...] = (
+    TestEndpoint("cp.cloudflare.com", "/generate_204", (204,)),
+    TestEndpoint("www.gstatic.com", "/generate_204", (204,)),
+    TestEndpoint("captive.apple.com", "/hotspot-detect.html", (200,)),
+)
+ENDPOINT_CHECK_TIMEOUT = 10.0
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
 
 ROUNDS = 3                 # a node must pass every round
@@ -257,8 +290,42 @@ def _log_tail(path: str, lines: int = 6) -> str:
         return "      (no log)"
 
 
-def _probe(port: int) -> tuple[bool, float]:
-    """Fetch the test URL through the loopback proxy on ``port``.
+def usable_endpoints() -> list[TestEndpoint]:
+    """Drop endpoints this machine cannot reach directly.
+
+    A blocked or broken target would otherwise fail every node in its round and
+    read as "the whole list is dead". Checked without a proxy, so it measures
+    the endpoint rather than any node.
+    """
+    usable: list[TestEndpoint] = []
+    for endpoint in TEST_ENDPOINTS:
+        connection = http.client.HTTPSConnection(
+            endpoint.host, 443, timeout=ENDPOINT_CHECK_TIMEOUT
+        )
+        try:
+            connection.request(
+                "GET", endpoint.path,
+                headers={"User-Agent": USER_AGENT, "Connection": "close"},
+            )
+            response = connection.getresponse()
+            response.read()
+            if response.status in endpoint.statuses:
+                usable.append(endpoint)
+            else:
+                print(f"  ! {endpoint.host} answered {response.status}; not testing against it")
+        except Exception as error:
+            print(f"  ! {endpoint.host} unreachable ({type(error).__name__});"
+                  " not testing against it")
+        finally:
+            try:
+                connection.close()
+            except Exception:
+                pass
+    return usable
+
+
+def _probe(port: int, endpoint: TestEndpoint) -> tuple[bool, float]:
+    """Fetch the endpoint through the loopback proxy on ``port``.
 
     ``HTTPSConnection`` + ``set_tunnel`` issues a CONNECT to Xray's HTTP inbound
     and then completes TLS end-to-end with the target, so a node that cannot
@@ -267,14 +334,14 @@ def _probe(port: int) -> tuple[bool, float]:
     started = time.monotonic()
     connection = http.client.HTTPSConnection("127.0.0.1", port, timeout=REQUEST_TIMEOUT)
     try:
-        connection.set_tunnel(TEST_HOST, 443)
+        connection.set_tunnel(endpoint.host, 443)
         connection.request(
-            "GET", TEST_PATH, headers={"User-Agent": USER_AGENT, "Connection": "close"}
+            "GET", endpoint.path, headers={"User-Agent": USER_AGENT, "Connection": "close"}
         )
         response = connection.getresponse()
         response.read()
         elapsed = (time.monotonic() - started) * 1000.0
-        return response.status == EXPECTED_STATUS, elapsed
+        return response.status in endpoint.statuses, elapsed
     except Exception:
         return False, (time.monotonic() - started) * 1000.0
     finally:
@@ -285,7 +352,7 @@ def _probe(port: int) -> tuple[bool, float]:
 
 
 def _run_batch(
-    xray: str, batch: list[Node], directory: str, label: str
+    xray: str, batch: list[Node], directory: str, label: str, endpoint: TestEndpoint
 ) -> dict[int, float]:
     """Return ``{index within batch: latency ms}`` for the nodes that passed."""
     config = _build_config(batch, BASE_PORT)
@@ -312,7 +379,9 @@ def _run_batch(
                 print(_log_tail(log_path))
                 return {}
             with ThreadPoolExecutor(max_workers=PROBE_WORKERS) as pool:
-                results = list(pool.map(lambda i: _probe(BASE_PORT + i), range(len(batch))))
+                results = list(
+                    pool.map(lambda i: _probe(BASE_PORT + i, endpoint), range(len(batch)))
+                )
         finally:
             process.terminate()
             try:
@@ -334,6 +403,14 @@ def check(
         counts["healthy"] = 0
         return []
 
+    endpoints = usable_endpoints()
+    if not endpoints:
+        raise HealthCheckError(
+            "no test endpoint is reachable, so nothing can be measured; "
+            "leaving the previous list in place"
+        )
+    counts["endpoints"] = [e.host for e in endpoints]
+
     with tempfile.TemporaryDirectory(prefix="xray-healthcheck-") as directory:
         accepted, rejected = validate_nodes(xray, nodes, directory)
         counts["rejected_by_xray"] = len(rejected)
@@ -348,19 +425,23 @@ def check(
         survivors = set(range(len(accepted)))
 
         for round_number in range(1, rounds + 1):
+            # Rotate: three rounds against three operators is a stronger claim
+            # than three rounds against one, at identical cost.
+            endpoint = endpoints[(round_number - 1) % len(endpoints)]
             passed: set[int] = set()
             for start in range(0, len(accepted), BATCH_SIZE):
                 batch = accepted[start : start + BATCH_SIZE]
                 label = f"r{round_number}-b{start // BATCH_SIZE}"
-                for offset, latency in _run_batch(xray, batch, directory, label).items():
+                batch_result = _run_batch(xray, batch, directory, label, endpoint)
+                for offset, latency in batch_result.items():
                     index = start + offset
                     passed.add(index)
                     latencies[index].append(latency)
             counts[f"round_{round_number}_passed"] = len(passed)
             survivors &= passed
             print(
-                f"  round {round_number}/{rounds}: {len(passed)}/{len(accepted)} passed, "
-                f"{len(survivors)} still perfect"
+                f"  round {round_number}/{rounds} via {endpoint.host}: "
+                f"{len(passed)}/{len(accepted)} passed, {len(survivors)} still perfect"
             )
             if round_number < rounds:
                 time.sleep(PAUSE_BETWEEN_ROUNDS)

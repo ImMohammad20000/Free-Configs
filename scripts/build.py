@@ -220,9 +220,15 @@ def render(links: list[str], counts: dict, sources: list[str]) -> str:
         " before health check)",
         f"# generated {stamp} from {len(sources)} source(s):",
         *(f"#   {url}" for url in sources),
-        f"# criterion: a real proxied request to https://{healthcheck.TEST_HOST}"
-        f"{healthcheck.TEST_PATH} succeeded in all"
-        f" {counts.get('rounds', healthcheck.ROUNDS)} independent runs",
+        f"# criterion: a real proxied request succeeded in all"
+        f" {counts.get('rounds', healthcheck.ROUNDS)} independent runs,"
+        " one per endpoint:",
+        *(
+            f"#   https://{host}"
+            for host in counts.get(
+                "endpoints", [e.host for e in healthcheck.TEST_ENDPOINTS]
+            )
+        ),
     ]
     if "flaky_percent" in counts:
         header.append(
