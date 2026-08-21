@@ -904,6 +904,46 @@ check(completed.returncode == 0, "sources: a URL with no scheme does not sink th
 check("live.example" in produced, "sources: the valid source still publishes alongside a typo")
 check("Traceback" not in completed.stderr, "sources: a malformed URL reports, not crashes")
 
+# Duplicate detection compares what a node IS, not how it is written: the
+# #comment is a display name and query-parameter order carries no meaning, so
+# neither may make two copies of one node look distinct. The comment on the
+# surviving copy still has to reach configs.txt.
+UID = "44444444-4444-4444-4444-444444444444"
+SAME = (
+    f"vless://{UID}@9.9.9.9:2053?security=tls&type=ws&host=live.example&path=/#FIRST NAME\n"
+    # identical node, different display name
+    f"vless://{UID}@9.9.9.9:2053?security=tls&type=ws&host=live.example&path=/#second name\n"
+    # identical node, query parameters in a different order
+    f"vless://{UID}@9.9.9.9:2053?path=/&host=live.example&type=ws&security=tls#third name\n"
+    # identical node again, both differences at once
+    f"vless://{UID}@9.9.9.9:2053?type=ws&security=tls&path=/&host=live.example#fourth\n"
+).encode()
+
+completed, _, produced = run_build(serve(SAME))
+emitted = [l for l in produced.splitlines() if l and not l.startswith("#")]
+check(completed.returncode == 0, "dedup: the four-copy list builds")
+check("1 distinct configs parsed" in completed.stdout,
+      "dedup: four spellings of one node collapse to one")
+check("3 duplicates dropped" in completed.stdout, "dedup: the other three are counted as repeats")
+check(len(emitted) == 2, "dedup: one node in, one node plus its rule 9 mirror out")
+# Names are percent-encoded on the wire, so decode before comparing.
+names = [parse_line(l).tag for l in emitted]
+check(all(n.startswith("FIRST NAME") for n in names),
+      "dedup: the surviving copy keeps its source comment in the published name")
+check(len(set(names)) == 2,
+      "dedup: the node and its mirror are still told apart by name")
+check(sorted(n.split(" | ")[1] for n in names) == ["443", "8080"],
+      "dedup: what distinguishes them is the port, appended after the comment")
+
+# Order-insensitivity at the identity level, independent of the build.
+a = parse_line(f"vless://{UID}@9.9.9.9:443?security=tls&type=ws&host=x.example#one")
+b = parse_line(f"vless://{UID}@9.9.9.9:443?host=x.example&type=ws&security=tls#two")
+check(a.identity() == b.identity(),
+      "dedup: field order does not change a node's identity")
+c = parse_line(f"vless://{UID}@9.9.9.9:443?security=tls&type=ws&host=OTHER.example#one")
+check(a.identity() != c.identity(),
+      "dedup: a genuinely different node keeps a different identity")
+
 # Every source dead is a different matter.
 completed, untouched, _ = run_build(
     serve(b"gone", status="404 Not Found") + "," + serve(b"gone", status="410 Gone")
@@ -924,8 +964,9 @@ check(len(emitted) == 2, "sources: the same node from two sources is deduped")
 # actually ran -- it is what keeps a large overlapping source from being
 # parsed twice.
 check(
-    "1 parsed as" in completed.stdout and "from 1 unique lines" in completed.stdout,
-    "sources: a duplicate line is dropped before parsing, not parsed twice",
+    "1 distinct configs parsed" in completed.stdout
+    and "1 duplicates dropped" in completed.stdout,
+    "sources: a repeated node is dropped once, not parsed twice",
 )
 check(
     sorted(parse_line(l).port for l in emitted) == ["443", "8080"],

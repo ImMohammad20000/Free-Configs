@@ -79,10 +79,14 @@ TLS_ONLY_KEYS = ("sni", "alpn", "fp", "cs")
 # than published as silent exceptions. Set True to publish them unmasked anyway.
 INCLUDE_VMESS = False
 
-# Replace upstream's country-flag names: after rule 10 every node exits through
-# the same Cloudflare address, so the original geography is misleading, and
-# rule 9 would otherwise give each node and its mirror the same name.
+# Keep each source's own comment (everything after "#") in the published name.
+# It cannot stand alone as the name, though: rule 9 gives every node a twin on
+# the other port, and one source labels all of its several thousand nodes
+# "@DeltaKroneckerGithub", so on its own the comment would leave most entries
+# indistinguishable in a client. The port and a short content hash are appended
+# to tell them apart. Set KEEP_SOURCE_COMMENT False for generated names only.
 RENAME_NODES = True
+KEEP_SOURCE_COMMENT = True
 NAME_PREFIX = ""
 
 
@@ -215,11 +219,20 @@ def rule_13_apply_8080_masking(node: Node) -> None:
 
 
 def make_tag(node: Node) -> str:
-    """Content-addressed name: identical input always yields an identical
-    name, so an unchanged upstream produces an unchanged configs.txt."""
+    """The published name: the source's own comment, then the port and a short
+    content hash. The hash is derived from the node itself, so the same node
+    always gets the same name and an unchanged upstream produces an unchanged
+    configs.txt."""
     digest = hashlib.sha256(repr(node.identity()).encode("utf-8")).hexdigest()[:6]
-    transport = "ws" if node.transport == "websocket" else node.transport
-    return f"{NAME_PREFIX}{node.port} | {node.host} | {node.scheme}-{transport} | {digest}"
+    parts = []
+    comment = node.tag.strip()
+    if KEEP_SOURCE_COMMENT and comment:
+        parts.append(comment)
+    else:
+        transport = "ws" if node.transport == "websocket" else node.transport
+        parts.append(f"{node.host} | {node.scheme}-{transport}")
+    parts += [node.port, digest]
+    return NAME_PREFIX + " | ".join(parts)
 
 
 # --- driver ---------------------------------------------------------------

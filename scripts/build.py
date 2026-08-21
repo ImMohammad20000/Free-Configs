@@ -257,20 +257,36 @@ def main() -> int:
     if failed:
         print(f"  ! continuing without {len(failed)} unreachable source(s)")
 
-    # Sources overlap, so drop repeated lines before parsing. Node-level dedup
-    # still happens after the rules run, once addresses have been rewritten.
-    seen_lines: set[str] = set()
+    # Sources overlap heavily, so drop repeats before anything expensive runs.
+    # Comparing raw text would miss most of them: the same node routinely
+    # appears under a different #comment, or with its query parameters in a
+    # different order. Both are cosmetic. Node.identity() compares what the
+    # node actually is -- protocol, credentials, address, port and parameters
+    # as a sorted set, with the display name excluded -- so reordered fields
+    # and renamed copies collapse together. The comment is kept on the copy
+    # that survives and is carried through to configs.txt.
+    seen: set = set()
     nodes = []
+    duplicates = 0
     for line in lines:
         stripped = line.strip()
-        if not stripped or stripped in seen_lines:
+        if not stripped:
             continue
-        seen_lines.add(stripped)
         node = parse_line(stripped)
-        if node is not None:
-            nodes.append(node)
+        if node is None:
+            continue
+        key = node.identity()
+        if key in seen:
+            duplicates += 1
+            continue
+        seen.add(key)
+        nodes.append(node)
     counts["parsed"] = len(nodes)
-    print(f"  {len(nodes)} parsed as vless/trojan/vmess from {len(seen_lines)} unique lines")
+    counts["duplicates_dropped"] = duplicates
+    print(
+        f"  {len(nodes)} distinct configs parsed"
+        f" ({duplicates} duplicates dropped, ignoring name and field order)"
+    )
 
     if not nodes:
         # A 200 response can still be the wrong thing -- an error page, or a
