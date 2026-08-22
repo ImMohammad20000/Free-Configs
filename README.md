@@ -1,6 +1,6 @@
 # Free-Configs
 
-Just add subscription link to [PattNG](https://github.com/patterniha/PattNG) and enjoy !
+Just add subscription link to [PattNG](https://github.com/patterniha/PattNG)/[PattN](https://github.com/patterniha/PattN) and enjoy !
  
 ```
 https://raw.githubusercontent.com/patterniha/Free-Configs/main/configs.txt
@@ -15,7 +15,7 @@ Updated every 24 hours.
 
 از آنجا که با روشهای زیادی میتوان محدودیت آپلود را روی کلودفلر دور زد، من در پروژه‌ی خودم اومدم کانفیگهای کلودفلر سالم را از پروژه‌‌های اصلی جدا کردم و تغییراتی را برای دور زدن محدودیت آپلود (و همچنین دور زدن فیلتر دامنه) اعمال کردم. بنابراین کانفیگهای نهایی سالم و با حداکثر سرعت در تمامی نتها قابل استفاده هستند.
 
-برای دور زدن محدودیت آپلود در نتهای آپلود محدود در حال حاضر فقط باید از کلاینت [PattNG](https://github.com/patterniha/PattNG) استفاده کنید، بزودی در سایر کلاینتها نیز این مورد پشتیبانی میشود.
+برای دور زدن محدودیت آپلود در نتهای آپلود محدود در حال حاضر فقط باید از کلاینت [PattNG](https://github.com/patterniha/PattNG)/[PattN](https://github.com/patterniha/PattN) استفاده کنید، بزودی در سایر کلاینتها نیز این مورد پشتیبانی میشود.
 
 ## حمایت
 
