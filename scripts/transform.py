@@ -22,7 +22,7 @@ from __future__ import annotations
 import hashlib
 from urllib.parse import quote, unquote
 
-from nodes import INSECURE_KEYS, Node
+from nodes import ECH_KEYS, INSECURE_KEYS, Node
 
 # --- rule 10: exit address ------------------------------------------------
 # Deliberately two separate constants applied by two separate functions, so
@@ -183,12 +183,15 @@ def rule_10_set_address_for_8080(node: Node) -> None:
         node.address = ADDRESS_FOR_PORT_8080
 
 
-# --- rule 11: strip certificate-verification opt-outs ---------------------
+# --- rule 11: strip certificate opt-outs and ECH --------------------------
+
+# Everything rule 11 removes from every node, whatever its spelling or case.
+STRIPPED_KEYS = INSECURE_KEYS + ECH_KEYS
 
 
 def rule_11_strip_insecure(node: Node) -> None:
     for key in list(node.params):
-        if key.lower() in INSECURE_KEYS:
+        if key.lower() in STRIPPED_KEYS:
             del node.params[key]
 
 

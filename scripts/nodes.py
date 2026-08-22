@@ -28,6 +28,12 @@ WS_ALIASES = ("ws", "websocket")
 # the wild. Rule 11 strips all of them.
 INSECURE_KEYS = ("allowinsecure", "allow_insecure", "insecure")
 
+# Encrypted Client Hello. Rule 11 strips this too: ECH encrypts the SNI, and
+# rule 12 sets the SNI to the fronted host precisely so Cloudflare can route on
+# it. The values seen in these lists ("ip.gs+udp://8.8.8.8") also make the
+# client fetch an ECH config over DNS before it can connect at all.
+ECH_KEYS = ("ech",)
+
 # Stable emit order, so an unchanged upstream produces a byte-identical
 # configs.txt and the daily commit is a real diff rather than noise.
 PARAM_ORDER = (

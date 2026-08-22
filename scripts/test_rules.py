@@ -177,16 +177,26 @@ check(probe.address == transform.ADDRESS_FOR_PORT_443, "rule 10: the 443 setter 
 
 # --- rule 11: strip certificate opt-outs -----------------------------------
 
-for spelling in ("allowInsecure", "allow_insecure", "insecure", "ALLOWINSECURE", "AllowInsecure"):
+for spelling in ("allowInsecure", "allow_insecure", "insecure", "ALLOWINSECURE",
+                 "AllowInsecure", "ech", "ECH", "Ech"):
     result = one(**{**BASE, spelling: "1"})
     check(
         all(not n.has(spelling) for n in result),
         f"rule 11: {spelling} removed",
     )
     check(
-        all("insecure" not in n.to_link().lower() for n in result),
+        all(f"{spelling.lower()}=" not in n.to_link().lower() for n in result),
         f"rule 11: {spelling} absent from the emitted link",
     )
+
+# ech is stripped even when it sits beside parameters that must survive.
+survivor = one(**{**BASE, "ech": "ip.gs+udp://8.8.8.8"})
+for node in survivor:
+    check(not node.has("ech"), "rule 11: ech removed from the node")
+    check("ech=" not in node.to_link(), "rule 11: ech absent from the emitted link")
+    check(node.get("host") == "a.example" and node.get("type") == "ws",
+          "rule 11: stripping ech leaves the other parameters intact")
+check(len(survivor) == 2, "rule 11: stripping ech does not drop the node")
 
 # --- rules 12/13: masking parameters ---------------------------------------
 
