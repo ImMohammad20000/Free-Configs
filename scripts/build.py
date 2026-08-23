@@ -187,17 +187,13 @@ def fetch(url: str) -> str:
     raise SystemExit(f"could not fetch {url}: {last_error}")
 
 
-def cap_nodes(nodes: list, limit: int) -> list:
-    """Trim the pool to ``limit`` nodes, keeping the two ports balanced.
+def _round_robin_by_port(nodes: list, limit: int) -> list:
+    """Take up to ``limit`` nodes, alternating between the port buckets.
 
-    Rule 9 gives every node a twin on the other port, and transform() emits all
-    the originals before all the mirrors. Plain truncation would therefore keep
-    mostly one port and drop the other wholesale, so this takes from the two
-    buckets alternately. The order within each bucket is untouched, which keeps
-    the choice deterministic: the same input yields the same selection.
+    Slicing would favour whichever port happens to come first in the list, so
+    the two are drawn from in turn. Order within a bucket is untouched, which
+    keeps the choice deterministic: the same input yields the same selection.
     """
-    if len(nodes) <= limit:
-        return nodes
     buckets: dict[str, list] = {}
     for node in nodes:
         buckets.setdefault(node.port, []).append(node)
@@ -216,6 +212,26 @@ def cap_nodes(nodes: list, limit: int) -> list:
         if not progressed:
             break
         index += 1
+    return kept
+
+
+def cap_nodes(nodes: list, limit: int) -> list:
+    """Trim the pool to ``limit`` nodes, originals before mirrors.
+
+    A node that came from a source outranks one rule 9 invented: the original
+    is a configuration someone published, while its twin is this pipeline's
+    guess that the same credentials also work on the other port. So the cap is
+    filled with originals first, and mirrors only get whatever room is left.
+    Within each of those two tiers the two ports are drawn from alternately,
+    so neither tier collapses onto a single port.
+    """
+    if len(nodes) <= limit:
+        return nodes
+    originals = [n for n in nodes if not n.is_mirror]
+    mirrors = [n for n in nodes if n.is_mirror]
+    kept = _round_robin_by_port(originals, limit)
+    if len(kept) < limit:
+        kept += _round_robin_by_port(mirrors, limit - len(kept))
     return kept
 
 

@@ -157,6 +157,7 @@ def rule_8_drop_tls_port_without_tls(node: Node) -> bool:
 def rule_9_mirror(node: Node) -> Node:
     """Return the opposite-transport twin of ``node``; the original is untouched."""
     twin = node.copy()
+    twin.is_mirror = True
     if twin.port == "8080":
         twin.port = "443"
         twin.set("security", "tls")

@@ -691,36 +691,63 @@ try:
 finally:
     healthcheck.usable_endpoints = real_usable
 
-# The cap on how many nodes reach the health check. It has to keep the two
-# ports balanced: transform() emits every original before every mirror, so
-# plain truncation would keep one port and discard the other wholesale.
-pool = []
-for i in range(60):
-    pool += one(**{**BASE, "host": f"h{i}.example"})
+# The cap on how many nodes reach the health check. Originals outrank mirrors:
+# an original is a configuration a source published, while its twin is only
+# this pipeline's guess that the same credentials also work on the other port.
+# Within each tier the two ports are drawn from alternately.
+originals_443 = []
+originals_8080 = []
+for i in range(30):
+    originals_443 += one(**{**BASE, "host": f"t{i}.example"})
+    originals_8080 += one(security="none", type="ws", path="/", port="8080",
+                          host=f"u{i}.example")
+pool = originals_443 + originals_8080
 check(len(pool) == 120, "cap: test pool built")
+originals = [n for n in pool if not n.is_mirror]
+mirrors = [n for n in pool if n.is_mirror]
+check(len(originals) == 60 and len(mirrors) == 60,
+      "cap: rule 9 marks exactly the twins it creates as mirrors")
+# copy() must carry the flag. rule_9_mirror sets it right after copying, so
+# nothing in the pipeline notices today -- but a copy that silently downgrades
+# a mirror to an original would put it back ahead of real nodes in the cap.
+a_mirror = next(n for n in pool if n.is_mirror)
+an_original = next(n for n in pool if not n.is_mirror)
+check(a_mirror.copy().is_mirror is True, "cap: copying a mirror keeps it a mirror")
+check(an_original.copy().is_mirror is False, "cap: copying an original keeps it an original")
 
 check(build.cap_nodes(pool, 500) is pool, "cap: a pool under the limit is returned untouched")
 check(len(build.cap_nodes(pool, 120)) == 120, "cap: a pool exactly at the limit is kept whole")
 
+# Below the number of originals, no mirror may be selected at all.
 trimmed = build.cap_nodes(pool, 40)
 check(len(trimmed) == 40, "cap: an oversized pool is trimmed to exactly the limit")
+check(not any(n.is_mirror for n in trimmed),
+      "cap: while originals remain, no mirror is selected")
 ports = collections.Counter(n.port for n in trimmed)
 check(ports["443"] == 20 and ports["8080"] == 20,
-      "cap: the two ports stay balanced rather than one being wiped out")
-check(len({n.identity() for n in trimmed}) == 40, "cap: trimming introduces no duplicates")
-check(all(n in pool for n in trimmed), "cap: trimming invents nothing")
+      "cap: within the originals the two ports stay balanced")
 
-# Odd limits must not lose or gain a node.
-for limit in (1, 7, 39, 119):
-    got = build.cap_nodes(pool, limit)
-    check(len(got) == limit, f"cap: limit {limit} yields exactly {limit} nodes")
+# Above it, every original is kept and mirrors fill the remainder.
+trimmed = build.cap_nodes(pool, 80)
+check(len(trimmed) == 80, "cap: limit 80 yields exactly 80 nodes")
+kept_ids = {id(n) for n in trimmed}
+check(all(id(n) in kept_ids for n in originals),
+      "cap: every original survives before any mirror is taken")
+check(sum(1 for n in trimmed if n.is_mirror) == 20,
+      "cap: the remaining room is filled from mirrors")
 
-# Deterministic: the same pool must give the sameselection every time.
+check(len({n.identity() for n in build.cap_nodes(pool, 40)}) == 40,
+      "cap: trimming introduces no duplicates")
+check(all(n in pool for n in build.cap_nodes(pool, 40)), "cap: trimming invents nothing")
+
+for limit in (1, 7, 39, 61, 119):
+    check(len(build.cap_nodes(pool, limit)) == limit,
+          f"cap: limit {limit} yields exactly {limit} nodes")
+
 check([n.identity() for n in build.cap_nodes(pool, 33)]
       == [n.identity() for n in build.cap_nodes(pool, 33)],
       "cap: the selection is deterministic")
 
-# A pool that is all one port is still handled.
 single = [n for n in pool if n.port == "443"]
 check(len(build.cap_nodes(single, 10)) == 10, "cap: a single-port pool trims correctly")
 check(build.cap_nodes([], 10) == [], "cap: an empty pool is handled")
@@ -1005,8 +1032,8 @@ check(len(capped) == 4, "cap: the build tests only the capped number of nodes")
 check("capped to 4 nodes" in completed.stdout, "cap: the build reports that it capped")
 check("8 dropped" in completed.stdout, "cap: the build reports how many it dropped")
 capped_ports = collections.Counter(parse_line(l).port for l in capped)
-check(capped_ports["443"] == 2 and capped_ports["8080"] == 2,
-      "cap: the capped selection keeps both ports")
+check(capped_ports["443"] == 4 and capped_ports["8080"] == 0,
+      "cap: originals (all on 443 here) fill the cap before any mirror")
 
 # Under the cap, nothing is dropped and nothing is reported.
 completed, _, produced = run_build(serve(SIX), MAX_NODES_TO_TEST="500")
