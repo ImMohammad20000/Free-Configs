@@ -2,10 +2,10 @@ name: Build subscription
 
 on:
   schedule:
-    # Every 24h. GitHub queues scheduled runs and can delay or skip them under
-    # load, so treat this as "about once a day" rather than a precise clock.
-    # An off-peak minute (not :00) tends to be dispatched more promptly.
-    - cron: "23 3 * * *"
+    # 10:00 UTC daily. GitHub queues scheduled runs and can delay or skip them
+    # under load, and the top of the hour is its busiest slot, so in practice
+    # this fires at or shortly after 10:00 rather than exactly on it.
+    - cron: "0 10 * * *"
   workflow_dispatch:
 
 permissions:
