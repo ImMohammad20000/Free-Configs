@@ -12,6 +12,7 @@ Environment overrides:
     OUTPUT_DIR        where configs.txt is written (default: repository root)
     SKIP_HEALTHCHECK  set to 1 to skip rule 14, for local dry runs
     HEALTHCHECK_ROUNDS number of independent rounds a node must pass (default 3)
+    MAX_NODES_TO_TEST most nodes the health check may test (default 20000)
 """
 
 from __future__ import annotations
@@ -63,6 +64,12 @@ RETRYABLE_FETCH_ERRORS = (urllib.error.URLError, OSError, http.client.HTTPExcept
 # yields fewer than this, the previous configs.txt is left in place and the
 # workflow fails loudly instead.
 MIN_HEALTHY_NODES = 1
+
+# Ceiling on how many nodes the health check is allowed to test. The pool grows
+# every time a source is added, and the health check is the expensive stage, so
+# this is what stops a run from outgrowing the workflow timeout. Nodes beyond
+# the cap are discarded before testing, never published untested.
+MAX_NODES_TO_TEST = int(os.environ.get("MAX_NODES_TO_TEST", "20000"))
 
 
 def is_permanent_http_error(error: BaseException) -> bool:
@@ -178,6 +185,38 @@ def fetch(url: str) -> str:
             if attempt < FETCH_ATTEMPTS:
                 time.sleep(3 * attempt)
     raise SystemExit(f"could not fetch {url}: {last_error}")
+
+
+def cap_nodes(nodes: list, limit: int) -> list:
+    """Trim the pool to ``limit`` nodes, keeping the two ports balanced.
+
+    Rule 9 gives every node a twin on the other port, and transform() emits all
+    the originals before all the mirrors. Plain truncation would therefore keep
+    mostly one port and drop the other wholesale, so this takes from the two
+    buckets alternately. The order within each bucket is untouched, which keeps
+    the choice deterministic: the same input yields the same selection.
+    """
+    if len(nodes) <= limit:
+        return nodes
+    buckets: dict[str, list] = {}
+    for node in nodes:
+        buckets.setdefault(node.port, []).append(node)
+    order = sorted(buckets)
+    kept: list = []
+    index = 0
+    while len(kept) < limit:
+        progressed = False
+        for port in order:
+            bucket = buckets[port]
+            if index < len(bucket):
+                kept.append(bucket[index])
+                progressed = True
+                if len(kept) == limit:
+                    break
+        if not progressed:
+            break
+        index += 1
+    return kept
 
 
 def locate_xray() -> str:
@@ -319,6 +358,19 @@ def main() -> int:
         f"  {counts['final_total']} nodes to test"
         f" ({counts['final_443']} on 443, {counts['final_8080']} on 8080)"
     )
+
+    if len(transformed) > MAX_NODES_TO_TEST:
+        dropped = len(transformed) - MAX_NODES_TO_TEST
+        transformed = cap_nodes(transformed, MAX_NODES_TO_TEST)
+        counts["dropped_over_cap"] = dropped
+        counts["final_443"] = sum(1 for n in transformed if n.port == "443")
+        counts["final_8080"] = sum(1 for n in transformed if n.port == "8080")
+        counts["final_total"] = len(transformed)
+        print(
+            f"  capped to {MAX_NODES_TO_TEST} nodes for the health check"
+            f" ({dropped} dropped, {counts['final_443']} on 443,"
+            f" {counts['final_8080']} on 8080)"
+        )
 
     if os.environ.get("SKIP_HEALTHCHECK") == "1":
         print("Skipping rule 14 (SKIP_HEALTHCHECK=1)")

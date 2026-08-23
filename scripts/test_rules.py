@@ -9,6 +9,7 @@ test named after it, plus parser edge cases and end-to-end properties.
 from __future__ import annotations
 
 import base64
+import collections
 import contextlib
 import http.client
 import io
@@ -25,6 +26,7 @@ from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import build  # noqa: E402
 import transform  # noqa: E402
 from nodes import Node, parse_line  # noqa: E402
 
@@ -689,13 +691,46 @@ try:
 finally:
     healthcheck.usable_endpoints = real_usable
 
+# The cap on how many nodes reach the health check. It has to keep the two
+# ports balanced: transform() emits every original before every mirror, so
+# plain truncation would keep one port and discard the other wholesale.
+pool = []
+for i in range(60):
+    pool += one(**{**BASE, "host": f"h{i}.example"})
+check(len(pool) == 120, "cap: test pool built")
+
+check(build.cap_nodes(pool, 500) is pool, "cap: a pool under the limit is returned untouched")
+check(len(build.cap_nodes(pool, 120)) == 120, "cap: a pool exactly at the limit is kept whole")
+
+trimmed = build.cap_nodes(pool, 40)
+check(len(trimmed) == 40, "cap: an oversized pool is trimmed to exactly the limit")
+ports = collections.Counter(n.port for n in trimmed)
+check(ports["443"] == 20 and ports["8080"] == 20,
+      "cap: the two ports stay balanced rather than one being wiped out")
+check(len({n.identity() for n in trimmed}) == 40, "cap: trimming introduces no duplicates")
+check(all(n in pool for n in trimmed), "cap: trimming invents nothing")
+
+# Odd limits must not lose or gain a node.
+for limit in (1, 7, 39, 119):
+    got = build.cap_nodes(pool, limit)
+    check(len(got) == limit, f"cap: limit {limit} yields exactly {limit} nodes")
+
+# Deterministic: the same pool must give the sameselection every time.
+check([n.identity() for n in build.cap_nodes(pool, 33)]
+      == [n.identity() for n in build.cap_nodes(pool, 33)],
+      "cap: the selection is deterministic")
+
+# A pool that is all one port is still handled.
+single = [n for n in pool if n.port == "443"]
+check(len(build.cap_nodes(single, 10)) == 10, "cap: a single-port pool trims correctly")
+check(build.cap_nodes([], 10) == [], "cap: an empty pool is handled")
+
 # --- fetch retry coverage --------------------------------------------------
 # A truncated response raises IncompleteRead, which is an HTTPException and NOT
 # an OSError, so a handler catching only OSError silently skips the retry and
 # lets the error escape as a traceback.
 
 
-import build  # noqa: E402
 
 for exc in (
     http.client.IncompleteRead,
@@ -851,7 +886,7 @@ def serve(body: bytes, status: str = "200 OK") -> str:
     return f"http://127.0.0.1:{sock.getsockname()[1]}/list.txt"
 
 
-def run_build(source_urls: str) -> tuple[subprocess.CompletedProcess, bool, str]:
+def run_build(source_urls: str, **extra_env) -> tuple[subprocess.CompletedProcess, bool, str]:
     """Run build.py against the given sources; report whether a pre-existing
     configs.txt survived, and its final contents."""
     staging = tempfile.mkdtemp(prefix="free-configs-test-")
@@ -865,6 +900,7 @@ def run_build(source_urls: str) -> tuple[subprocess.CompletedProcess, bool, str]
         OUTPUT_DIR=staging,
         SKIP_HEALTHCHECK="1",
         PYTHONIOENCODING="utf-8",
+        **extra_env,
     )
     completed = subprocess.run(
         [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "build.py")],
@@ -953,6 +989,30 @@ check(a.identity() == b.identity(),
 c = parse_line(f"vless://{UID}@9.9.9.9:443?security=tls&type=ws&host=OTHER.example#one")
 check(a.identity() != c.identity(),
       "dedup: a genuinely different node keeps a different identity")
+
+# The cap has to be wired into the build, not just implemented. Six distinct
+# nodes become twelve after rule 9; a cap of 4 must leave exactly 4.
+SIX = "".join(
+    f"vless://55555555-5555-5555-5555-55555555555{i}@9.9.9.9:2053"
+    f"?security=tls&type=ws&host=c{i}.example&path=/#n{i}\n"
+    for i in range(6)
+).encode()
+
+completed, _, produced = run_build(serve(SIX), MAX_NODES_TO_TEST="4")
+capped = [l for l in produced.splitlines() if l and not l.startswith("#")]
+check(completed.returncode == 0, "cap: a capped build succeeds")
+check(len(capped) == 4, "cap: the build tests only the capped number of nodes")
+check("capped to 4 nodes" in completed.stdout, "cap: the build reports that it capped")
+check("8 dropped" in completed.stdout, "cap: the build reports how many it dropped")
+capped_ports = collections.Counter(parse_line(l).port for l in capped)
+check(capped_ports["443"] == 2 and capped_ports["8080"] == 2,
+      "cap: the capped selection keeps both ports")
+
+# Under the cap, nothing is dropped and nothing is reported.
+completed, _, produced = run_build(serve(SIX), MAX_NODES_TO_TEST="500")
+check(len([l for l in produced.splitlines() if l and not l.startswith("#")]) == 12,
+      "cap: a pool under the limit is published whole")
+check("capped to" not in completed.stdout, "cap: no cap message when the limit is not reached")
 
 # Every source dead is a different matter.
 completed, untouched, _ = run_build(
