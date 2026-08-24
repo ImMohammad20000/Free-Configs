@@ -1150,6 +1150,75 @@ check(
 for sock in SERVERS:
     sock.close()
 
+# Locating the core, reading the previous file, and tailing a log. Small, but
+# each has a failure path a user actually meets: a wrong XRAY_BIN, a missing
+# configs.txt on the very first run, and a batch that died before logging.
+
+_saved_xray_bin = os.environ.get("XRAY_BIN")
+_scratch = tempfile.mkdtemp(prefix="free-configs-misc-")
+try:
+    real_binary = os.path.join(_scratch, "xray-stub")
+    with open(real_binary, "w", encoding="utf-8") as handle:
+        handle.write("stub")
+
+    os.environ["XRAY_BIN"] = real_binary
+    check(build.locate_xray() == real_binary, "locate: XRAY_BIN is used when it exists")
+
+    os.environ["XRAY_BIN"] = os.path.join(_scratch, "not-here")
+    try:
+        build.locate_xray()
+        check(False, "locate: a missing XRAY_BIN is rejected")
+    except SystemExit as error:
+        check("not-here" in str(error),
+              "locate: a missing XRAY_BIN is rejected, naming the path")
+
+    # Nothing on PATH and nothing in bin/: the message has to say what is
+    # needed, since this is what a broken install step looks like in CI.
+    os.environ.pop("XRAY_BIN", None)
+    _real_which, _real_root = shutil.which, build.REPO_ROOT
+    try:
+        build.shutil.which = lambda name: None
+        build.REPO_ROOT = _scratch
+        try:
+            build.locate_xray()
+            check(False, "locate: absent core is reported")
+        except SystemExit as error:
+            check("v26.6.22" in str(error) and "XRAY_BIN" in str(error),
+                  "locate: absent core names both the fix and the version floor")
+    finally:
+        build.shutil.which = _real_which
+        build.REPO_ROOT = _real_root
+
+    # existing_links: what the publish step compares against.
+    missing = os.path.join(_scratch, "nope.txt")
+    check(build.existing_links(missing) == [],
+          "publish: a missing previous file reads as no links, not an error")
+    header_only = os.path.join(_scratch, "header.txt")
+    with open(header_only, "w", encoding="utf-8") as handle:
+        handle.write("#profile-title: x\n# a comment\n\n")
+    check(build.existing_links(header_only) == [],
+          "publish: a file of only comments reads as no links")
+    with_links = os.path.join(_scratch, "some.txt")
+    with open(with_links, "w", encoding="utf-8") as handle:
+        handle.write("#header\nvless://a\n\nvless://b\n")
+    check(build.existing_links(with_links) == ["vless://a", "vless://b"],
+          "publish: links are read and comments and blanks skipped")
+
+    # _log_tail: only ever used when something already went wrong.
+    check("(no log)" in healthcheck._log_tail(os.path.join(_scratch, "absent.log")),
+          "log tail: a missing log does not raise while reporting a failure")
+    log_file = os.path.join(_scratch, "x.log")
+    with open(log_file, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(f"line {i}" for i in range(20)) + "\n")
+    tail = healthcheck._log_tail(log_file, lines=3)
+    check(tail.count("\n") == 2 and "line 19" in tail and "line 16" not in tail,
+          "log tail: the last lines are returned, not the first")
+finally:
+    shutil.rmtree(_scratch, ignore_errors=True)
+    os.environ.pop("XRAY_BIN", None)
+    if _saved_xray_bin is not None:
+        os.environ["XRAY_BIN"] = _saved_xray_bin
+
 # --- report ----------------------------------------------------------------
 
 print(f"{PASSED} checks passed, {len(FAILURES)} failed")
