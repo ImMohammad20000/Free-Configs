@@ -87,7 +87,12 @@ REQUEST_TIMEOUT = 5.0      # seconds, matches upstream's 5000ms budget
 # simultaneous network load modest without paying the 6x that 4 costs.
 BATCH_SIZE = 96            # nodes per Xray process
 PROBE_WORKERS = 32         # concurrent probes within a batch
-BASE_PORT = 21080          # first loopback inbound port
+# Loopback ports are asked of the OS rather than fixed. A hardcoded range
+# fails wholesale if anything else on the machine already listens in it, and
+# the failure looks like "every node in this batch is dead". Idea taken from
+# 4n0nymou3/multi-proxy-config-fetcher, which allocates per config; this
+# reserves the whole batch at once so no two inbounds can collide.
+PORT_RESERVE_ATTEMPTS = 3
 STARTUP_TIMEOUT = 15.0     # seconds to wait for Xray to bind its inbounds
 SHUTDOWN_TIMEOUT = 5.0
 PAUSE_BETWEEN_ROUNDS = 3.0
@@ -97,7 +102,7 @@ class HealthCheckError(RuntimeError):
     pass
 
 
-def _build_config(batch: list[Node], base_port: int) -> dict:
+def _build_config(batch: list[Node], ports: list[int]) -> dict:
     inbounds: list[dict] = []
     # The blackhole is listed first so it is Xray's default outbound: anything
     # not matched by an explicit rule is dropped rather than sent out directly.
@@ -111,7 +116,7 @@ def _build_config(batch: list[Node], base_port: int) -> dict:
             {
                 "tag": in_tag,
                 "listen": "127.0.0.1",
-                "port": base_port + index,
+                "port": ports[index],
                 "protocol": "http",
                 "settings": {},
             }
@@ -126,6 +131,40 @@ def _build_config(batch: list[Node], base_port: int) -> dict:
         "outbounds": outbounds,
         "routing": {"rules": rules},
     }
+
+
+def _placeholder_ports(count: int) -> list[int]:
+    """Port numbers for configs that are only validated, never run. ``xray run
+    -test`` binds nothing, so these need to be well-formed, not free."""
+    return list(range(21080, 21080 + count))
+
+
+def reserve_ports(count: int) -> list[int]:
+    """Ask the OS for ``count`` free loopback ports.
+
+    Every socket is held open until the whole set is chosen, so the OS cannot
+    hand the same port out twice within one batch. They are released just
+    before Xray binds them: a foreign process could still take one in that
+    window, which is why a batch that fails to come up is reported rather than
+    silently counted as dead nodes.
+    """
+    for attempt in range(PORT_RESERVE_ATTEMPTS):
+        holders: list[socket.socket] = []
+        try:
+            for _ in range(count):
+                holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                holder.bind(("127.0.0.1", 0))
+                holders.append(holder)
+            ports = [h.getsockname()[1] for h in holders]
+            if len(set(ports)) == count:
+                return ports
+        except OSError:
+            if attempt == PORT_RESERVE_ATTEMPTS - 1:
+                raise
+        finally:
+            for holder in holders:
+                holder.close()
+    raise HealthCheckError(f"could not reserve {count} free ports")
 
 
 def _write_config(config: dict, directory: str, name: str) -> str:
@@ -163,7 +202,7 @@ def validate_nodes(
 
     def group_builds(group: list[Node]) -> bool:
         try:
-            config = _build_config(group, BASE_PORT)
+            config = _build_config(group, _placeholder_ports(len(group)))
         except Exception:
             # A node whose outbound cannot even be rendered -- unparseable fm,
             # say -- is a node to reject, not a reason to abandon the run. The
@@ -223,7 +262,8 @@ def preflight(xray: str) -> list[str]:
     failures: list[str] = []
     with tempfile.TemporaryDirectory(prefix="xray-preflight-") as directory:
         for description, node in preflight_probes():
-            if not _config_accepted(xray, _build_config([node], BASE_PORT), directory):
+            config = _build_config([node], _placeholder_ports(1))
+            if not _config_accepted(xray, config, directory):
                 failures.append(description)
     return failures
 
@@ -369,7 +409,8 @@ def _run_batch(
     xray: str, batch: list[Node], directory: str, label: str, endpoint: TestEndpoint
 ) -> dict[int, float]:
     """Return ``{index within batch: latency ms}`` for the nodes that passed."""
-    config = _build_config(batch, BASE_PORT)
+    ports = reserve_ports(len(batch))
+    config = _build_config(batch, ports)
     config_path = _write_config(config, directory, f"{label}.json")
     log_path = os.path.join(directory, f"{label}.log")
 
@@ -381,9 +422,8 @@ def _run_batch(
             stderr=subprocess.STDOUT,
         )
         try:
-            ports = [BASE_PORT, BASE_PORT + len(batch) - 1]
             deadline = time.monotonic() + STARTUP_TIMEOUT
-            if not _wait_until_listening(ports, deadline, process):
+            if not _wait_until_listening([ports[0], ports[-1]], deadline, process):
                 # Distinguish "Xray never came up" from "every node failed" --
                 # otherwise a bind error silently reads as 32 dead nodes.
                 print(
@@ -394,7 +434,7 @@ def _run_batch(
                 return {}
             with ThreadPoolExecutor(max_workers=PROBE_WORKERS) as pool:
                 results = list(
-                    pool.map(lambda i: _probe(BASE_PORT + i, endpoint), range(len(batch)))
+                    pool.map(lambda i: _probe(ports[i], endpoint), range(len(batch)))
                 )
         finally:
             process.terminate()

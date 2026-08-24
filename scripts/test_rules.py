@@ -399,7 +399,8 @@ for node in grpc:
 import healthcheck  # noqa: E402
 
 batch = [n for spec in ({}, {"host": "b.example"}, {"host": "c.example"}) for n in one(**{**BASE, **spec})]
-config = healthcheck._build_config(batch, healthcheck.BASE_PORT)
+batch_ports = healthcheck._placeholder_ports(len(batch))
+config = healthcheck._build_config(batch, batch_ports)
 
 # If the default outbound were freedom rather than blackhole, traffic that
 # missed its rule would go out directly and EVERY node would look healthy.
@@ -418,8 +419,8 @@ check(
     "healthcheck: inbound N routes to outbound N, never to a neighbour",
 )
 ports = [i["port"] for i in config["inbounds"]]
-check(ports == list(range(healthcheck.BASE_PORT, healthcheck.BASE_PORT + len(batch))),
-      "healthcheck: inbound ports are unique and sequential")
+check(ports == batch_ports, "healthcheck: each inbound binds the port it was given")
+check(len(set(ports)) == len(ports), "healthcheck: no two inbounds share a port")
 check(all(i["listen"] == "127.0.0.1" for i in config["inbounds"]),
       "healthcheck: inbounds bind loopback only")
 check(
@@ -483,10 +484,13 @@ class _FakeProcess:
 
 probed_ports: list[int] = []
 probed_endpoints: list[str] = []
+FIXED_PORTS = [50101, 50102, 50103, 50104, 50105, 50106]
+real_reserve = healthcheck.reserve_ports
 real_popen = healthcheck.subprocess.Popen
 real_wait = healthcheck._wait_until_listening
 real_probe = healthcheck._probe
 try:
+    healthcheck.reserve_ports = lambda count: FIXED_PORTS[:count]
     healthcheck.subprocess.Popen = lambda *a, **k: _FakeProcess()
     healthcheck._wait_until_listening = lambda ports, deadline, process=None: True
     # Latency encodes the port, so a mis-mapped result is visible in the output.
@@ -500,25 +504,44 @@ try:
                                     tempfile.gettempdir(), "unit",
                                     healthcheck.TEST_ENDPOINTS[0])
 finally:
+    healthcheck.reserve_ports = real_reserve
     healthcheck.subprocess.Popen = real_popen
     healthcheck._wait_until_listening = real_wait
     healthcheck._probe = real_probe
 
-expected_ports = list(range(healthcheck.BASE_PORT, healthcheck.BASE_PORT + len(scored_batch)))
-check(sorted(probed_ports) == expected_ports,
-      "healthcheck: each node in a batch is probed on its own port, once")
+check(sorted(probed_ports) == FIXED_PORTS[:len(scored_batch)],
+      "healthcheck: each node in a batch is probed on its own reserved port, once")
 check(
-    all(latency == float(healthcheck.BASE_PORT + index) for index, latency in mapped.items()),
+    all(latency == float(FIXED_PORTS[index]) for index, latency in mapped.items()),
     "healthcheck: a probe result is credited to the node it came from",
 )
 check(
-    set(mapped) == {i for i in range(len(scored_batch))
-                    if (healthcheck.BASE_PORT + i) % 2 == 0},
+    set(mapped) == {i for i in range(len(scored_batch)) if FIXED_PORTS[i] % 2 == 0},
     "healthcheck: only the nodes that passed appear in the result",
 )
 check(set(probed_endpoints) == {healthcheck.TEST_ENDPOINTS[0].host},
       "healthcheck: every node in a batch is measured against the same endpoint")
 
+
+# Ports come from the OS, not a fixed range: a hardcoded range fails wholesale
+# if anything else on the machine already listens in it.
+reserved = healthcheck.reserve_ports(8)
+check(len(reserved) == 8, "ports: the requested number of ports is reserved")
+check(len(set(reserved)) == 8, "ports: reserved ports are distinct")
+check(all(1024 < p < 65536 for p in reserved), "ports: reserved ports are usable numbers")
+bound = []
+try:
+    for p_ in reserved:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", p_))
+        bound.append(srv)
+    check(True, "ports: every reserved port can actually be bound afterwards")
+except OSError:
+    check(False, "ports: every reserved port can actually be bound afterwards")
+finally:
+    for srv in bound:
+        srv.close()
+check(healthcheck.reserve_ports(0) == [], "ports: reserving none is not an error")
 
 # check() decides what is published. A node must pass EVERY round: passing
 # some rounds is what "flaky" means, and publishing those is the mistake the
@@ -610,7 +633,7 @@ check(
     "healthcheck: probes use the real exit address, not a placeholder",
 )
 for _, node in probes:
-    rendered = json.dumps(healthcheck._build_config([node], healthcheck.BASE_PORT))
+    rendered = json.dumps(healthcheck._build_config([node], healthcheck._placeholder_ports(1)))
     check("finalmask" in rendered, f"healthcheck: the port {node.port} probe renders a finalmask")
 
 
