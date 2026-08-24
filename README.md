@@ -17,6 +17,24 @@ Updated every 24 hours.
 
 برای دور زدن محدودیت آپلود در نتهای آپلود محدود در حال حاضر فقط باید از کلاینت [PattNG](https://github.com/patterniha/PattNG)/[PattN](https://github.com/patterniha/PattN) استفاده کنید، بزودی در سایر کلاینتها نیز این مورد پشتیبانی میشود.
 
+### منابع استفاده شده
+
+https://github.com/0xRadikal/Free-v2ray-Configs
+
+https://github.com/itsyebekhe/PSG
+
+https://github.com/Delta-Kronecker/V2ray-Config
+
+https://github.com/mahsanet/MahsaFreeConfig
+
+https://github.com/iampedii/whitedns-sub
+
+https://openproxylist.com/v2ray
+
+https://github.com/4n0nymou3/multi-proxy-config-fetcher
+
+https://github.com/roosterkid/openproxylist
+
 ## حمایت
 
 اگر کارهای بنده باعث دسترسی شما به اینترنت آزاد شده است ممنون میشم حمایتی هم از اینجانب انجام دهید
