@@ -543,6 +543,28 @@ finally:
         srv.close()
 check(healthcheck.reserve_ports(0) == [], "ports: reserving none is not an error")
 
+# A batch that cannot get ports must not take the whole run down with it: the
+# rounds already completed would be lost.
+_real_reserve = healthcheck.reserve_ports
+try:
+    def _refuse(count):
+        raise OSError("no ports today")
+
+    healthcheck.reserve_ports = _refuse
+    with contextlib.redirect_stdout(io.StringIO()) as captured:
+        result = healthcheck._run_batch(
+            "xray", [n for n in one(**BASE)], tempfile.gettempdir(), "unit",
+            healthcheck.TEST_ENDPOINTS[0],
+        )
+    check(result == {}, "ports: a batch that cannot reserve ports is simply untested")
+    check("could not reserve" in captured.getvalue(),
+          "ports: the reservation failure is reported, not swallowed")
+finally:
+    healthcheck.reserve_ports = _real_reserve
+check(healthcheck._run_batch("xray", [], tempfile.gettempdir(), "unit",
+                             healthcheck.TEST_ENDPOINTS[0]) == {},
+      "ports: an empty batch is handled without indexing past the end")
+
 # check() decides what is published. A node must pass EVERY round: passing
 # some rounds is what "flaky" means, and publishing those is the mistake the
 # three-round design exists to avoid.

@@ -409,7 +409,17 @@ def _run_batch(
     xray: str, batch: list[Node], directory: str, label: str, endpoint: TestEndpoint
 ) -> dict[int, float]:
     """Return ``{index within batch: latency ms}`` for the nodes that passed."""
-    ports = reserve_ports(len(batch))
+    if not batch:
+        return {}
+    try:
+        ports = reserve_ports(len(batch))
+    except (OSError, HealthCheckError) as error:
+        # One batch failing to get ports is not a reason to abandon the run and
+        # lose the rounds already completed. Report it and treat the batch as
+        # untested, exactly as a failed Xray start is treated below.
+        print(f"  ! {label}: could not reserve {len(batch)} ports ({error});"
+              f" {len(batch)} nodes not tested this round")
+        return {}
     config = _build_config(batch, ports)
     config_path = _write_config(config, directory, f"{label}.json")
     log_path = os.path.join(directory, f"{label}.log")
