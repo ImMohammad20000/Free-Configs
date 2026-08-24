@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 from urllib.parse import quote
 
@@ -564,6 +565,37 @@ finally:
 check(healthcheck._run_batch("xray", [], tempfile.gettempdir(), "unit",
                              healthcheck.TEST_ENDPOINTS[0]) == {},
       "ports: an empty batch is handled without indexing past the end")
+
+# _wait_until_listening only probes the first and last port of a batch. That is
+# only safe because Xray refuses to start at all when any one inbound cannot
+# bind -- verified against the real core, which exits with "failed to listen
+# TCP on <port>" and binds nothing. What makes the shortcut safe is polling the
+# process, so a dead process must end the wait immediately rather than at the
+# deadline.
+class _DeadProcess:
+    def poll(self):
+        return 1
+
+
+started = time.monotonic()
+check(
+    healthcheck._wait_until_listening([1], time.monotonic() + 30, _DeadProcess()) is False,
+    "ports: a process that has already exited ends the wait",
+)
+check(time.monotonic() - started < 5,
+      "ports: it notices immediately rather than waiting out the deadline")
+
+
+class _LingeringProcess:
+    def poll(self):
+        return None
+
+
+check(
+    healthcheck._wait_until_listening([1], time.monotonic() + 0.5, _LingeringProcess())
+    is False,
+    "ports: a port that never opens times out rather than hanging",
+)
 
 # check() decides what is published. A node must pass EVERY round: passing
 # some rounds is what "flaky" means, and publishing those is the mistake the
