@@ -35,6 +35,8 @@ https://github.com/4n0nymou3/multi-proxy-config-fetcher
 
 https://github.com/roosterkid/openproxylist
 
+https://github.com/iampedii/whitedns-sub
+
 ## حمایت
 
 اگر کارهای بنده باعث دسترسی شما به اینترنت آزاد شده است ممنون میشم حمایتی هم از اینجانب انجام دهید
