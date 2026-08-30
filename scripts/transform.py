@@ -27,8 +27,8 @@ from nodes import ECH_KEYS, INSECURE_KEYS, Node
 # --- rule 10: exit address ------------------------------------------------
 # Deliberately two separate constants applied by two separate functions, so
 # either port's exit address can be repointed without touching the other.
-ADDRESS_FOR_PORT_443 = "188.114.97.6"
-ADDRESS_FOR_PORT_8080 = "188.114.97.6"
+ADDRESS_FOR_PORT_443 = "104.21.70.21"
+ADDRESS_FOR_PORT_8080 = "104.21.70.21"
 
 # --- rules 4-6: port buckets ---------------------------------------------
 PORTS_MAPPED_TO_443 = ("443", "2053", "2083", "2087", "2096", "8443")
