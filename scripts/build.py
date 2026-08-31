@@ -12,7 +12,7 @@ Environment overrides:
     OUTPUT_DIR        where configs.txt is written (default: repository root)
     SKIP_HEALTHCHECK  set to 1 to skip rule 14, for local dry runs
     HEALTHCHECK_ROUNDS number of independent rounds a node must pass (default 3)
-    MAX_NODES_TO_TEST most nodes the health check may test (default 20000)
+    MAX_NODES_TO_TEST most nodes the health check may test (default 50000)
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ MIN_HEALTHY_NODES = 1
 # every time a source is added, and the health check is the expensive stage, so
 # this is what stops a run from outgrowing the workflow timeout. Nodes beyond
 # the cap are discarded before testing, never published untested.
-MAX_NODES_TO_TEST = int(os.environ.get("MAX_NODES_TO_TEST", "20000"))
+MAX_NODES_TO_TEST = int(os.environ.get("MAX_NODES_TO_TEST", "50000"))
 
 
 def is_permanent_http_error(error: BaseException) -> bool:
