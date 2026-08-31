@@ -3,7 +3,7 @@
 Just add subscription link to [PattNG](https://github.com/patterniha/PattNG)/[PattN](https://github.com/patterniha/PattN) and enjoy !
  
 ```
-https://raw.githubusercontent.com/patterniha/Free-Configs/main/configs.txt
+https://raw.githubusercontent.com/patterniha/Free-Configs/main/configs.txt#Patterniha-F
 ```
 
 Updated every 24 hours.
