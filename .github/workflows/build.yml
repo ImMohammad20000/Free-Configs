@@ -18,9 +18,11 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Health-check cost scales with the node pool, which grows as sources are
-    # added: run 3 spent 780s on 1495 nodes. Headroom for that to keep growing.
-    timeout-minutes: 45
+    # The health check dominates the run and its cost scales with the node
+    # pool, which grows with every source added. Run 25 was killed at the old
+    # 45 minute limit mid-check and published nothing. GitHub's ceiling for a
+    # hosted runner is 6 hours; 4 leaves room to notice a runaway before that.
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
