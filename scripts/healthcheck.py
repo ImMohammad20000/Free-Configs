@@ -269,21 +269,21 @@ def preflight(xray: str) -> list[str]:
 
 
 def preflight_probes() -> list[tuple[str, Node]]:
-    """The two configurations the pipeline actually emits: a TLS node carrying
-    the full masking set, and a plaintext node on the public exit address.
+    """The configuration the pipeline emits: a TLS node on port 443 carrying
+    the full masking set.
 
-    The addresses come from transform's rule 10 constants rather than being
-    written out again here, so repointing either exit address repoints what the
-    preflight tests along with it.
+    There used to be a second probe for plaintext port 8080 nodes. Rule 9
+    converts those to TLS now, so that shape is never published. The address
+    comes from transform's rule 10 constant rather than being written out
+    again, so repointing the exit repoints what the preflight tests.
     """
-    blank_uuid = "00000000-0000-0000-0000-000000000000"
     return [
         (
             "port 443 masking (fp=unsafe + fm fragment + cs cipherSuites)",
             Node(
                 scheme="vless",
-                uid=blank_uuid,
-                address=transform.ADDRESS_FOR_PORT_443,
+                uid="00000000-0000-0000-0000-000000000000",
+                address=transform.EXIT_ADDRESS,
                 port="443",
                 params={
                     "encryption": "none",
@@ -295,23 +295,6 @@ def preflight_probes() -> list[tuple[str, Node]]:
                     "fp": transform.FP_443,
                     "fm": transform.FM_443,
                     "cs": transform.CS_443,
-                },
-            ),
-        ),
-        (
-            "port 8080 unencrypted outbound to a public address (fm fragment)",
-            Node(
-                scheme="vless",
-                uid=blank_uuid,
-                address=transform.ADDRESS_FOR_PORT_8080,
-                port="8080",
-                params={
-                    "encryption": "none",
-                    "security": "none",
-                    "type": "ws",
-                    "host": "example.com",
-                    "path": "/",
-                    "fm": transform.FM_8080,
                 },
             ),
         ),

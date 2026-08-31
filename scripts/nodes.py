@@ -101,7 +101,6 @@ class Node:
     extra: dict = field(default_factory=dict)     # vmess-only fields to round-trip
     source: str = ""                              # original line, for diagnostics
     latency_ms: int | None = None                 # filled in by the health check
-    is_mirror: bool = False                       # created by rule 9, not by a source
 
     # -- parameter access -------------------------------------------------
     # Share links are inconsistent about case ("allowInsecure" vs
@@ -153,7 +152,6 @@ class Node:
             tag=self.tag,
             extra=dict(self.extra),
             source=self.source,
-            is_mirror=self.is_mirror,
         )
 
     def identity(self) -> tuple:

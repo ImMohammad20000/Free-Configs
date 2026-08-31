@@ -98,7 +98,13 @@ for port in transform.PORTS_MAPPED_TO_443:
 for port in transform.PORTS_MAPPED_TO_8080:
     result = one(**{**BASE, "security": "none", "port": port})
     check(bool(result), f"rule 4: port {port} accepted")
-    check(any(n.port == "8080" for n in result), f"rule 6: port {port} maps to 8080")
+    # Rule 6 puts it on 8080, then rule 9 moves it to 443, so end to end it
+    # lands on 443. Rule 6 itself is checked in isolation, since its result is
+    # now an intermediate state no published node is ever left in.
+    check(all(n.port == "443" for n in result), f"rules 6+9: port {port} ends up on 443")
+    staged = parse_line(link(**{**BASE, "security": "none", "port": port}))
+    transform.rule_6_normalise_to_8080(staged)
+    check(staged.port == "8080", f"rule 6 isolated: port {port} normalises to 8080")
 
 for port in ("22", "8444", "0", "65536", "443abc", "", "abc"):
     check(not survives(**{**BASE, "port": port}), f"rule 4: port {port!r} rejected")
@@ -115,68 +121,50 @@ check(not survives(security="none", type="ws", host="a.example", port="443"),
 check(not survives(type="ws", host="a.example", port="2053"),
       "rule 8: 443-bucket without security drops")
 
-# --- rule 9: mirroring -----------------------------------------------------
+# --- rule 9: plaintext nodes are converted to TLS --------------------------
 
+# A TLS node passes through untouched.
 result = one(**BASE)
-check(len(result) == 2, "rule 9: one input yields the node plus its mirror")
-ports = sorted(n.port for n in result)
-check(ports == ["443", "8080"], "rule 9: mirror lands on the opposite port")
+check(len(result) == 1, "rule 9: a node is no longer duplicated")
+only = result[0]
+check(only.port == "443" and only.security == "tls", "rule 9: a TLS node stays as it is")
 
-original = next(n for n in result if n.port == "443")
-mirror = next(n for n in result if n.port == "8080")
-check(original.security == "tls", "rule 9: original 443 keeps tls")
-check(mirror.security == "none", "rule 9: 443->8080 mirror sets security=none")
-check(not mirror.get("sni"), "rule 9: 443->8080 mirror removes sni")
-check(original.get("sni") == "a.example", "rule 9: original keeps its sni")
-
+# A plaintext node is moved onto 443 with TLS and an sni naming its host.
 result = one(security="none", type="ws", host="b.example", path="/", port="8080")
-up = next(n for n in result if n.port == "443")
-down = next(n for n in result if n.port == "8080")
-check(up.security == "tls", "rule 9: 8080->443 mirror sets security=tls")
-check(up.get("sni") == "b.example", "rule 9: 8080->443 mirror sets sni=host")
-check(down.security == "none", "rule 9: original 8080 unchanged")
+check(len(result) == 1, "rule 9: a plaintext node yields one node, not two")
+moved = result[0]
+check(moved.port == "443", "rule 9: a plaintext node moves to port 443")
+check(moved.security == "tls", "rule 9: the converted node carries security=tls")
+check(moved.get("sni") == "b.example", "rule 9: the converted node gets sni=host")
 
-# Mutating one must not touch the other (shared-dict regression guard).
-a, b = one(**BASE)
-a.set("path", "/mutated")
-check(b.get("path") != "/mutated", "rule 9: mirror does not share the params dict")
+# Nothing anywhere may still be on 8080 -- that is the whole point.
+for spec in ({}, {"security": "none", "port": "8080"}, {"port": "2082", "security": "none"},
+             {"port": "2053"}, {"port": "8880", "security": "none"}):
+    for node in one(**{**BASE, **spec}):
+        check(node.port == "443", f"rule 9: {spec or 'default'} ends up on 443")
+        check(node.security == "tls", f"rule 9: {spec or 'default'} ends up on TLS")
 
-# rule_9_mirror in isolation. Going through transform() cannot prove rule 9
-# removes sni, because rule 13 strips it from plaintext nodes anyway.
-probe = parse_line(link(**BASE))
-probe.port = "443"
-probe.set("sni", "orig.example")
-twin = transform.rule_9_mirror(probe)
-check(twin.port == "8080", "rule 9 isolated: 443 mirrors to 8080")
-check(not twin.get("sni"), "rule 9 isolated: mirror removes sni itself")
-check(twin.security == "none", "rule 9 isolated: mirror sets security=none itself")
-check(probe.get("sni") == "orig.example", "rule 9 isolated: original keeps its sni")
-check(probe.port == "443", "rule 9 isolated: original keeps its port")
-
+# rule_9_convert_to_tls in isolation.
 probe = parse_line(link(security="none", type="ws", host="c.example", path="/", port="8080"))
 probe.port = "8080"
-twin = transform.rule_9_mirror(probe)
-check(twin.port == "443", "rule 9 isolated: 8080 mirrors to 443")
-check(twin.security == "tls", "rule 9 isolated: mirror sets security=tls itself")
-check(twin.get("sni") == "c.example", "rule 9 isolated: mirror sets sni=host itself")
-check(probe.security == "none", "rule 9 isolated: original stays plaintext")
+transform.rule_9_convert_to_tls(probe)
+check(probe.port == "443" and probe.security == "tls" and probe.get("sni") == "c.example",
+      "rule 9 isolated: a plaintext node is converted in place")
+already = parse_line(link(**BASE))
+already.set("sni", "orig.example")
+transform.rule_9_convert_to_tls(already)
+check(already.port == "443" and already.get("sni") == "orig.example",
+      "rule 9 isolated: a node already on 443 is left alone")
 
 # --- rule 10: exit address -------------------------------------------------
 
 for node in one(**BASE):
-    expected = (
-        transform.ADDRESS_FOR_PORT_443 if node.port == "443" else transform.ADDRESS_FOR_PORT_8080
-    )
-    check(node.address == expected, f"rule 10: port {node.port} uses its own address constant")
+    check(node.address == transform.EXIT_ADDRESS, "rule 10: the node uses the exit address")
 
-# The two constants must be applied by separate functions so either can move.
 probe = parse_line(link(**BASE))
-probe.port = "443"
 probe.address = "0.0.0.0"
-transform.rule_10_set_address_for_8080(probe)
-check(probe.address == "0.0.0.0", "rule 10: the 8080 setter ignores a 443 node")
-transform.rule_10_set_address_for_443(probe)
-check(probe.address == transform.ADDRESS_FOR_PORT_443, "rule 10: the 443 setter applies")
+transform.rule_10_set_address(probe)
+check(probe.address == transform.EXIT_ADDRESS, "rule 10: the setter applies the exit address")
 
 # --- rule 11: strip certificate opt-outs -----------------------------------
 
@@ -199,45 +187,41 @@ for node in survivor:
     check("ech=" not in node.to_link(), "rule 11: ech absent from the emitted link")
     check(node.get("host") == "a.example" and node.get("type") == "ws",
           "rule 11: stripping ech leaves the other parameters intact")
-check(len(survivor) == 2, "rule 11: stripping ech does not drop the node")
+check(len(survivor) == 1, "rule 11: stripping ech does not drop the node")
 
-# --- rules 12/13: masking parameters ---------------------------------------
+# --- rule 12: masking parameters -------------------------------------------
 
 for node in one(**BASE):
-    if node.port == "443":
-        check(node.get("fp") == "unsafe", "rule 12: fp=unsafe")
-        check(node.get("fm") == transform.FM_443, "rule 12: fm value")
-        check(node.get("cs") == transform.CS_443, "rule 12: cs value")
-        emitted = node.to_link()
-        check(transform.FM_443_ENCODED in emitted, "rule 12: fm is byte-exact in the link")
-        check(transform.CS_443_ENCODED in emitted, "rule 12: cs is byte-exact in the link")
-        check("fp=unsafe" in emitted, "rule 12: fp is byte-exact in the link")
-    else:
-        check(node.get("fm") == transform.FM_8080, "rule 13: fm value")
-        check(transform.FM_8080_ENCODED in node.to_link(), "rule 13: fm is byte-exact in the link")
-        for key in transform.TLS_ONLY_KEYS:
-            check(not node.get(key), f"rule 13: {key} stripped from a plaintext node")
+    check(node.get("fp") == "unsafe", "rule 12: fp=unsafe")
+    check(node.get("fm") == transform.FM_443, "rule 12: fm value")
+    check(node.get("cs") == transform.CS_443, "rule 12: cs value")
+    emitted = node.to_link()
+    check(transform.FM_443_ENCODED in emitted, "rule 12: fm is byte-exact in the link")
+    check(transform.CS_443_ENCODED in emitted, "rule 12: cs is byte-exact in the link")
+    check("fp=unsafe" in emitted, "rule 12: fp is byte-exact in the link")
 
-# A plaintext node that arrives carrying TLS-only parameters must lose them.
-# The mirror path never sets these, so only a source node like this exercises it.
-plaintext = one(
+# A converted plaintext node gets the same masking as any other.
+for node in one(security="none", type="ws", host="d.example", path="/", port="8080"):
+    check(node.get("fp") == "unsafe" and node.get("fm") == transform.FM_443
+          and node.get("cs") == transform.CS_443,
+          "rule 12: a converted node is masked like any other")
+
+# A node arriving with stale TLS parameters has them overwritten by rule 12
+# rather than stripped -- there is no plaintext output to strip them for.
+inherited = one(
     security="none", type="ws", host="c.example", path="/", port="8080",
     alpn="h2,http/1.1", fp="chrome", cs="TLS_AES_128_GCM_SHA256", sni="stale.example",
 )
-down = next(n for n in plaintext if n.port == "8080")
-for key in transform.TLS_ONLY_KEYS:
-    check(not down.get(key), f"rule 13: inherited {key} stripped from a plaintext node")
-check("alpn" not in down.to_link(), "rule 13: alpn absent from the emitted plaintext link")
-up = next(n for n in plaintext if n.port == "443")
-check(up.get("fp") == "unsafe", "rule 12: mirror of a plaintext node still gets fp=unsafe")
+check(len(inherited) == 1, "rule 12: a converted node is still a single node")
+converted = inherited[0]
+check(converted.get("fp") == "unsafe", "rule 12: a stale fp is overwritten")
+check(converted.get("cs") == transform.CS_443, "rule 12: a stale cs is overwritten")
+check(converted.get("sni") == "c.example", "rule 12: a stale sni is replaced by the host")
 
 # Existing values must be overwritten, not kept ("set/change").
 for node in one(**{**BASE, "fp": "chrome", "fm": "junk", "cs": "junk"}):
-    if node.port == "443":
-        check(node.get("fp") == "unsafe", "rule 12: existing fp is overwritten")
-        check(node.get("fm") == transform.FM_443, "rule 12: existing fm is overwritten")
-    else:
-        check(node.get("fm") == transform.FM_8080, "rule 13: existing fm is overwritten")
+    check(node.get("fp") == "unsafe", "rule 12: existing fp is overwritten")
+    check(node.get("fm") == transform.FM_443, "rule 12: existing fm is overwritten")
 
 # --- parser edge cases -----------------------------------------------------
 
@@ -277,10 +261,10 @@ for node in one(**BASE):
 # --- dedup -----------------------------------------------------------------
 
 pair = [parse_line(link(**BASE)), parse_line(link(**BASE))]
-check(len(transform.transform(pair, {})) == 2, "dedup: identical inputs collapse to one node + mirror")
+check(len(transform.transform(pair, {})) == 1, "dedup: identical inputs collapse to one node")
 
 differing = [parse_line(link(**BASE)), parse_line(link(**{**BASE, "host": "other.example"}))]
-check(len(transform.transform(differing, {})) == 4, "dedup: different hosts stay distinct")
+check(len(transform.transform(differing, {})) == 2, "dedup: different hosts stay distinct")
 
 # --- vmess -----------------------------------------------------------------
 
@@ -329,13 +313,11 @@ real_include = transform.INCLUDE_VMESS
 try:
     transform.INCLUDE_VMESS = True
     vm_out = transform.transform([parse_line(VMESS_FULL)], {})
-    check(len(vm_out) == 2, "vmess: with the toggle on it survives and gains its mirror")
-    vm443 = next(n for n in vm_out if n.port == "443")
-    vm8080 = next(n for n in vm_out if n.port == "8080")
-    check(vm443.address == transform.ADDRESS_FOR_PORT_443 and vm443.security == "tls",
+    check(len(vm_out) == 1, "vmess: with the toggle on it survives as a single node")
+    vm443 = vm_out[0]
+    check(vm443.address == transform.EXIT_ADDRESS and vm443.security == "tls",
           "vmess: rules 8 and 10 apply to a vmess node")
-    check(vm8080.security == "none" and not vm8080.get("sni"),
-          "vmess: rule 9 mirrors a vmess node to plaintext")
+    check(vm443.port == "443", "vmess: a vmess node ends up on 443 like any other")
     check(vm443.get("fm") == transform.FM_443 and vm443.get("cs") == transform.CS_443,
           "vmess: rule 12 sets fm and cs on the node")
 
@@ -351,7 +333,7 @@ try:
           "vmess: fm really is absent from the emitted link")
     check(payload["tls"] == "tls" and payload["sni"] == "vm.example",
           "vmess: what the format can carry is still carried")
-    check(payload["add"] == transform.ADDRESS_FOR_PORT_443 and payload["port"] == "443",
+    check(payload["add"] == transform.EXIT_ADDRESS and payload["port"] == "443",
           "vmess: the rewritten address and port reach the wire format")
 finally:
     transform.INCLUDE_VMESS = real_include
@@ -361,7 +343,6 @@ finally:
 for name, encoded, decoded in (
     ("FM_443", transform.FM_443_ENCODED, transform.FM_443),
     ("CS_443", transform.CS_443_ENCODED, transform.CS_443),
-    ("FM_8080", transform.FM_8080_ENCODED, transform.FM_8080),
 ):
     check(quote(decoded, safe="") == encoded, f"constants: {name} survives a decode/encode cycle")
 
@@ -669,21 +650,18 @@ finally:
 # The preflight has to exercise both shapes the pipeline emits, or it proves
 # nothing about the core it is about to trust.
 probes = healthcheck.preflight_probes()
-check({node.port for _, node in probes} == {"443", "8080"},
-      "healthcheck: preflight checks both the TLS and the plaintext shape")
-tls_probe = next(node for _, node in probes if node.port == "443")
-plain_probe = next(node for _, node in probes if node.port == "8080")
+check({node.port for _, node in probes} == {"443"},
+      "healthcheck: preflight checks the one shape the pipeline emits")
+tls_probe = probes[0][1]
 check(
     tls_probe.get("fp") == "unsafe"
     and tls_probe.get("fm") == transform.FM_443
     and tls_probe.get("cs") == transform.CS_443,
-    "healthcheck: the TLS probe carries the real fp, fm and cs values",
+    "healthcheck: the probe carries the real fp, fm and cs values",
 )
-check(plain_probe.get("fm") == transform.FM_8080 and plain_probe.security == "none",
-      "healthcheck: the plaintext probe is an unencrypted outbound with the 8080 fm")
+check(tls_probe.security == "tls", "healthcheck: the probe is a TLS outbound")
 check(
-    all(node.address == transform.ADDRESS_FOR_PORT_443
-        or node.address == transform.ADDRESS_FOR_PORT_8080 for _, node in probes),
+    all(node.address == transform.EXIT_ADDRESS for _, node in probes),
     "healthcheck: probes use the real exit address, not a placeholder",
 )
 for _, node in probes:
@@ -768,65 +746,26 @@ try:
 finally:
     healthcheck.usable_endpoints = real_usable
 
-# The cap on how many nodes reach the health check. Originals outrank mirrors:
-# an original is a configuration a source published, while its twin is only
-# this pipeline's guess that the same credentials also work on the other port.
-# Within each tier the two ports are drawn from alternately.
-originals_443 = []
-originals_8080 = []
-for i in range(30):
-    originals_443 += one(**{**BASE, "host": f"t{i}.example"})
-    originals_8080 += one(security="none", type="ws", path="/", port="8080",
-                          host=f"u{i}.example")
-pool = originals_443 + originals_8080
-check(len(pool) == 120, "cap: test pool built")
-originals = [n for n in pool if not n.is_mirror]
-mirrors = [n for n in pool if n.is_mirror]
-check(len(originals) == 60 and len(mirrors) == 60,
-      "cap: rule 9 marks exactly the twins it creates as mirrors")
-# copy() must carry the flag. rule_9_mirror sets it right after copying, so
-# nothing in the pipeline notices today -- but a copy that silently downgrades
-# a mirror to an original would put it back ahead of real nodes in the cap.
-a_mirror = next(n for n in pool if n.is_mirror)
-an_original = next(n for n in pool if not n.is_mirror)
-check(a_mirror.copy().is_mirror is True, "cap: copying a mirror keeps it a mirror")
-check(an_original.copy().is_mirror is False, "cap: copying an original keeps it an original")
+# The cap on how many nodes reach the health check. Rule 9 converts rather than
+# duplicates now, so there are no mirrors to rank below originals and no second
+# port to balance against -- the cap is a plain trim that keeps input order.
+pool = []
+for i in range(60):
+    pool += one(**{**BASE, "host": f"t{i}.example"})
+check(len(pool) == 60, "cap: test pool built")
+check(all(n.port == "443" for n in pool), "cap: every node in the pool is on 443")
 
 check(build.cap_nodes(pool, 500) is pool, "cap: a pool under the limit is returned untouched")
-check(len(build.cap_nodes(pool, 120)) == 120, "cap: a pool exactly at the limit is kept whole")
+check(len(build.cap_nodes(pool, 60)) == 60, "cap: a pool exactly at the limit is kept whole")
 
-# Below the number of originals, no mirror may be selected at all.
 trimmed = build.cap_nodes(pool, 40)
 check(len(trimmed) == 40, "cap: an oversized pool is trimmed to exactly the limit")
-check(not any(n.is_mirror for n in trimmed),
-      "cap: while originals remain, no mirror is selected")
-ports = collections.Counter(n.port for n in trimmed)
-check(ports["443"] == 20 and ports["8080"] == 20,
-      "cap: within the originals the two ports stay balanced")
+check(trimmed == pool[:40], "cap: the trim keeps input order, so it is deterministic")
+check(len({n.identity() for n in trimmed}) == 40, "cap: trimming introduces no duplicates")
 
-# Above it, every original is kept and mirrors fill the remainder.
-trimmed = build.cap_nodes(pool, 80)
-check(len(trimmed) == 80, "cap: limit 80 yields exactly 80 nodes")
-kept_ids = {id(n) for n in trimmed}
-check(all(id(n) in kept_ids for n in originals),
-      "cap: every original survives before any mirror is taken")
-check(sum(1 for n in trimmed if n.is_mirror) == 20,
-      "cap: the remaining room is filled from mirrors")
-
-check(len({n.identity() for n in build.cap_nodes(pool, 40)}) == 40,
-      "cap: trimming introduces no duplicates")
-check(all(n in pool for n in build.cap_nodes(pool, 40)), "cap: trimming invents nothing")
-
-for limit in (1, 7, 39, 61, 119):
+for limit in (1, 7, 39, 59):
     check(len(build.cap_nodes(pool, limit)) == limit,
           f"cap: limit {limit} yields exactly {limit} nodes")
-
-check([n.identity() for n in build.cap_nodes(pool, 33)]
-      == [n.identity() for n in build.cap_nodes(pool, 33)],
-      "cap: the selection is deterministic")
-
-single = [n for n in pool if n.port == "443"]
-check(len(build.cap_nodes(single, 10)) == 10, "cap: a single-port pool trims correctly")
 check(build.cap_nodes([], 10) == [], "cap: an empty pool is handled")
 
 # --- fetch retry coverage --------------------------------------------------
@@ -1075,15 +1014,11 @@ check(completed.returncode == 0, "dedup: the four-copy list builds")
 check("1 distinct configs parsed" in completed.stdout,
       "dedup: four spellings of one node collapse to one")
 check("3 duplicates dropped" in completed.stdout, "dedup: the other three are counted as repeats")
-check(len(emitted) == 2, "dedup: one node in, one node plus its rule 9 mirror out")
+check(len(emitted) == 1, "dedup: four spellings of one node yield one published node")
 # Names are percent-encoded on the wire, so decode before comparing.
 names = [parse_line(l).tag for l in emitted]
 check(all(n.startswith("FIRST NAME") for n in names),
       "dedup: the surviving copy keeps its source comment in the published name")
-check(len(set(names)) == 2,
-      "dedup: the node and its mirror are still told apart by name")
-check(sorted(n.split(" | ")[1] for n in names) == ["443", "8080"],
-      "dedup: what distinguishes them is the port, appended after the comment")
 
 # Order-insensitivity at the identity level, independent of the build.
 a = parse_line(f"vless://{UID}@9.9.9.9:443?security=tls&type=ws&host=x.example#one")
@@ -1107,14 +1042,13 @@ capped = [l for l in produced.splitlines() if l and not l.startswith("#")]
 check(completed.returncode == 0, "cap: a capped build succeeds")
 check(len(capped) == 4, "cap: the build tests only the capped number of nodes")
 check("capped to 4 nodes" in completed.stdout, "cap: the build reports that it capped")
-check("8 dropped" in completed.stdout, "cap: the build reports how many it dropped")
-capped_ports = collections.Counter(parse_line(l).port for l in capped)
-check(capped_ports["443"] == 4 and capped_ports["8080"] == 0,
-      "cap: originals (all on 443 here) fill the cap before any mirror")
+check("2 dropped" in completed.stdout, "cap: the build reports how many it dropped")
+check(all(parse_line(l).port == "443" for l in capped),
+      "cap: everything published is on 443")
 
 # Under the cap, nothing is dropped and nothing is reported.
 completed, _, produced = run_build(serve(SIX), MAX_NODES_TO_TEST="500")
-check(len([l for l in produced.splitlines() if l and not l.startswith("#")]) == 12,
+check(len([l for l in produced.splitlines() if l and not l.startswith("#")]) == 6,
       "cap: a pool under the limit is published whole")
 check("capped to" not in completed.stdout, "cap: no cap message when the limit is not reached")
 
@@ -1133,7 +1067,7 @@ check(completed.returncode == 0, "sources: a base64 source is accepted")
 # One input node listed by both sources must yield exactly two output nodes --
 # itself and its rule 9 mirror -- not four.
 emitted = [l for l in produced.splitlines() if l and not l.startswith("#")]
-check(len(emitted) == 2, "sources: the same node from two sources is deduped")
+check(len(emitted) == 1, "sources: the same node from two sources is deduped")
 # Node-level dedup would collapse these anyway, so assert the line-level pass
 # actually ran -- it is what keeps a large overlapping source from being
 # parsed twice.
@@ -1142,10 +1076,8 @@ check(
     and "1 duplicates dropped" in completed.stdout,
     "sources: a repeated node is dropped once, not parsed twice",
 )
-check(
-    sorted(parse_line(l).port for l in emitted) == ["443", "8080"],
-    "sources: the deduped node still gains its mirror",
-)
+check(parse_line(emitted[0]).port == "443",
+      "sources: the surviving node is published on 443")
 
 for sock in SERVERS:
     sock.close()

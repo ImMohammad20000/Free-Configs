@@ -1,20 +1,24 @@
-"""Rules 1-13: turn the upstream list into the Cloudflare-fronted node set.
+"""Rules 1-12: turn the upstream lists into the Cloudflare-fronted node set.
 
 Every numbered rule from the spec is its own function below, named after its
 number, and :func:`transform` applies them in order. Tunables are grouped at
 the top of the file.
 
-Three normalisations are applied on top of the numbered rules; each is marked
-NORMALISATION where it happens and explained in README.md:
+Everything published is TLS on port 443. Nodes arriving on a plaintext
+Cloudflare port are converted rather than kept alongside a TLS twin: the ISP
+this list is built for blocks unencrypted connections to Cloudflare, so a
+port 8080 node is untestable and unusable. That single invariant is what keeps
+the rest of the file short -- there is one exit address, no rule 13, and no
+plaintext-only parameters to strip.
 
-* the port 443 -> 8080 mirror (rule 9) also drops TLS, because a plaintext
-  Cloudflare port cannot complete a TLS handshake -- this is the same
-  invariant rule 7 enforces on the original nodes;
-* every port 443 node gets ``sni`` set to its ``host``, because rule 10
-  replaces the address with a Cloudflare IP and Cloudflare routes HTTPS by
-  SNI -- an ``sni`` still pointing at the origin server would never connect;
-* TLS-only parameters (``sni``, ``alpn``, ``fp``, ``cs``) are dropped from
-  port 8080 nodes, where they are inert.
+Two normalisations are applied on top of the numbered rules, each marked
+NORMALISATION where it happens:
+
+* rule 9 sets ``sni`` to ``host`` when converting, because the node is being
+  moved onto TLS and Cloudflare selects the origin by SNI;
+* every node gets ``sni`` set to its ``host``, because rule 10 replaces the
+  address with a Cloudflare IP -- an ``sni`` still naming the origin server
+  would never connect.
 """
 
 from __future__ import annotations
@@ -25,10 +29,10 @@ from urllib.parse import quote, unquote
 from nodes import ECH_KEYS, INSECURE_KEYS, Node
 
 # --- rule 10: exit address ------------------------------------------------
-# Deliberately two separate constants applied by two separate functions, so
-# either port's exit address can be repointed without touching the other.
-ADDRESS_FOR_PORT_443 = "104.21.70.21"
-ADDRESS_FOR_PORT_8080 = "104.21.70.21"
+# Every node exits here. There were two constants back when plaintext nodes
+# were published alongside TLS ones; rule 9 converts them now, so one address
+# covers everything.
+EXIT_ADDRESS = "104.21.70.21"
 
 # --- rules 4-6: port buckets ---------------------------------------------
 PORTS_MAPPED_TO_443 = ("443", "2053", "2083", "2087", "2096", "8443")
@@ -38,7 +42,7 @@ PORTS_MAPPED_TO_8080 = ("80", "8080", "8880", "2052", "2082", "2086", "2095")
 ALLOWED_SECURITY = ("", "tls", "none")
 ALLOWED_TRANSPORTS = ("ws", "xhttp", "websocket", "httpupgrade", "grpc")
 
-# --- rules 12-13: client-side masking ------------------------------------
+# --- rule 12: client-side masking ----------------------------------------
 # Stored exactly as supplied (percent-encoded), decoded once at import. The
 # self-check below proves re-encoding reproduces these strings byte for byte,
 # so what lands in configs.txt is what was asked for.
@@ -59,32 +63,21 @@ CS_443_ENCODED = (
     "%3ATLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA%3ATLS_ECDHE_RSA_WITH_AES_256_CBC_SHA%3A"
     "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256%3ATLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256"
 )
-FM_8080_ENCODED = (
-    "%7B%22tcp%22%3A%20%5B%7B%22type%22%3A%20%22fragment%22%2C%20%22settings%22%3A%20%7B%22"
-    "packets%22%3A%20%221-1%22%2C%20%22lengths%22%3A%20%5B%221%22%5D%2C%20%22delays%22%3A%20"
-    "%5B%224%22%5D%2C%20%22maxSplit%22%3A%20%22355%22%7D%7D%5D%7D"
-)
-
 FP_443 = unquote(FP_443_ENCODED)
 FM_443 = unquote(FM_443_ENCODED)
 CS_443 = unquote(CS_443_ENCODED)
-FM_8080 = unquote(FM_8080_ENCODED)
-
-# Parameters that only mean anything under TLS.
-TLS_ONLY_KEYS = ("sni", "alpn", "fp", "cs")
 
 # A vmess share link is base64'd JSON with a fixed key set, and that key set has
-# nowhere to put fm or cs -- so a vmess node cannot satisfy rules 12-13 and would
+# nowhere to put fm or cs -- so a vmess node cannot satisfy rule 12 and would
 # ship without the fragmentation every other node gets. They are dropped rather
 # than published as silent exceptions. Set True to publish them unmasked anyway.
 INCLUDE_VMESS = False
 
 # Keep each source's own comment (everything after "#") in the published name.
-# It cannot stand alone as the name, though: rule 9 gives every node a twin on
-# the other port, and one source labels all of its several thousand nodes
-# "@DeltaKroneckerGithub", so on its own the comment would leave most entries
-# indistinguishable in a client. The port and a short content hash are appended
-# to tell them apart. Set KEEP_SOURCE_COMMENT False for generated names only.
+# It cannot stand alone, though: one source labels all of its several thousand
+# nodes "@DeltaKroneckerGithub", so on its own the comment would leave most
+# entries indistinguishable in a client. A short content hash is appended to
+# tell them apart. Set KEEP_SOURCE_COMMENT False for generated names only.
 RENAME_NODES = True
 KEEP_SOURCE_COMMENT = True
 NAME_PREFIX = ""
@@ -96,7 +89,6 @@ def _self_check() -> None:
     for name, encoded, decoded in (
         ("FM_443", FM_443_ENCODED, FM_443),
         ("CS_443", CS_443_ENCODED, CS_443),
-        ("FM_8080", FM_8080_ENCODED, FM_8080),
     ):
         if quote(decoded, safe="") != encoded:
             raise AssertionError(f"{name} does not round-trip through percent-encoding")
@@ -151,37 +143,32 @@ def rule_8_drop_tls_port_without_tls(node: Node) -> bool:
     return not (node.port == "443" and node.security != "tls")
 
 
-# --- rule 9: mirror -------------------------------------------------------
+# --- rule 9: move plaintext nodes onto TLS --------------------------------
 
 
-def rule_9_mirror(node: Node) -> Node:
-    """Return the opposite-transport twin of ``node``; the original is untouched."""
-    twin = node.copy()
-    twin.is_mirror = True
-    if twin.port == "8080":
-        twin.port = "443"
-        twin.set("security", "tls")
-        twin.set("sni", twin.host)
-    elif twin.port == "443":
-        twin.port = "8080"
-        twin.pop("sni")
-        # NORMALISATION: a plaintext Cloudflare port cannot serve TLS, so the
-        # mirror drops it -- the same invariant rule 7 enforces on originals.
-        twin.set("security", "none")
-    return twin
+def rule_9_convert_to_tls(node: Node) -> None:
+    """Move a plaintext node onto port 443 with TLS.
+
+    This used to duplicate each node onto the other port and publish both. It
+    does not any more: the ISP this list is built for blocks unencrypted
+    connections to Cloudflare, so a port 8080 node cannot be reached, which
+    makes it both untestable and useless. Converting instead of duplicating
+    also halves the pool the health check has to work through.
+    """
+    if node.port != "8080":
+        return
+    node.port = "443"
+    node.set("security", "tls")
+    # NORMALISATION: the node is being moved onto TLS, and Cloudflare selects
+    # the origin by SNI, so it has to name the fronted host.
+    node.set("sni", node.host)
 
 
 # --- rule 10: exit address ------------------------------------------------
 
 
-def rule_10_set_address_for_443(node: Node) -> None:
-    if node.port == "443":
-        node.address = ADDRESS_FOR_PORT_443
-
-
-def rule_10_set_address_for_8080(node: Node) -> None:
-    if node.port == "8080":
-        node.address = ADDRESS_FOR_PORT_8080
+def rule_10_set_address(node: Node) -> None:
+    node.address = EXIT_ADDRESS
 
 
 # --- rule 11: strip certificate opt-outs and ECH --------------------------
@@ -196,27 +183,17 @@ def rule_11_strip_insecure(node: Node) -> None:
             del node.params[key]
 
 
-# --- rules 12-13: masking parameters --------------------------------------
+# --- rule 12: masking parameters ------------------------------------------
 
 
-def rule_12_apply_443_masking(node: Node) -> None:
-    if node.port != "443":
-        return
+def rule_12_apply_masking(node: Node) -> None:
+    """Every node is TLS on 443 by now, so this applies to all of them."""
     node.set("fp", FP_443)
     node.set("fm", FM_443)
     node.set("cs", CS_443)
     # NORMALISATION: rule 10 puts a Cloudflare IP in the address field, and
     # Cloudflare selects the origin by SNI, so SNI has to be the fronted host.
     node.set("sni", node.host)
-
-
-def rule_13_apply_8080_masking(node: Node) -> None:
-    if node.port != "8080":
-        return
-    node.set("fm", FM_8080)
-    # NORMALISATION: TLS-only parameters are inert on a plaintext port.
-    for key in TLS_ONLY_KEYS:
-        node.pop(key)
 
 
 # --- naming ---------------------------------------------------------------
@@ -228,22 +205,22 @@ def make_tag(node: Node) -> str:
     always gets the same name and an unchanged upstream produces an unchanged
     configs.txt."""
     digest = hashlib.sha256(repr(node.identity()).encode("utf-8")).hexdigest()[:6]
-    parts = []
     comment = node.tag.strip()
     if KEEP_SOURCE_COMMENT and comment:
-        parts.append(comment)
+        head = comment
     else:
         transport = "ws" if node.transport == "websocket" else node.transport
-        parts.append(f"{node.host} | {node.scheme}-{transport}")
-    parts += [node.port, digest]
-    return NAME_PREFIX + " | ".join(parts)
+        head = f"{node.host} | {node.scheme}-{transport}"
+    # The port used to be part of the name, to separate a node from its twin
+    # on the other port. There are no twins now, and every node is on 443.
+    return f"{NAME_PREFIX}{head} | {digest}"
 
 
 # --- driver ---------------------------------------------------------------
 
 
 def transform(nodes: list[Node], stats: dict | None = None) -> list[Node]:
-    """Apply rules 1-13 and return the deduplicated result."""
+    """Apply rules 1-12 and return the deduplicated result."""
     counts: dict = stats if stats is not None else {}
 
     def bump(key: str, amount: int = 1) -> None:
@@ -281,21 +258,18 @@ def transform(nodes: list[Node], stats: dict | None = None) -> list[Node]:
 
     bump("kept_after_rules_1_to_8", len(kept))
 
-    # Rule 9: each survivor gains its opposite-transport twin.
-    mirrors = [rule_9_mirror(node) for node in kept]
-    bump("mirrors_added_rule_9", len(mirrors))
-    everything = kept + mirrors
-
-    for node in everything:
-        rule_10_set_address_for_443(node)
-        rule_10_set_address_for_8080(node)
+    for node in kept:
+        was_plaintext = node.port == "8080"
+        rule_9_convert_to_tls(node)
+        if was_plaintext:
+            bump("converted_to_tls_rule_9")
+        rule_10_set_address(node)
         rule_11_strip_insecure(node)
-        rule_12_apply_443_masking(node)
-        rule_13_apply_8080_masking(node)
+        rule_12_apply_masking(node)
 
     deduped: list[Node] = []
     seen: set[tuple] = set()
-    for node in everything:
+    for node in kept:
         key = node.identity()
         if key in seen:
             bump("dropped_duplicate")
@@ -305,7 +279,5 @@ def transform(nodes: list[Node], stats: dict | None = None) -> list[Node]:
             node.tag = make_tag(node)
         deduped.append(node)
 
-    bump("final_443", sum(1 for n in deduped if n.port == "443"))
-    bump("final_8080", sum(1 for n in deduped if n.port == "8080"))
     bump("final_total", len(deduped))
     return deduped

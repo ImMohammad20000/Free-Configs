@@ -187,52 +187,16 @@ def fetch(url: str) -> str:
     raise SystemExit(f"could not fetch {url}: {last_error}")
 
 
-def _round_robin_by_port(nodes: list, limit: int) -> list:
-    """Take up to ``limit`` nodes, alternating between the port buckets.
-
-    Slicing would favour whichever port happens to come first in the list, so
-    the two are drawn from in turn. Order within a bucket is untouched, which
-    keeps the choice deterministic: the same input yields the same selection.
-    """
-    buckets: dict[str, list] = {}
-    for node in nodes:
-        buckets.setdefault(node.port, []).append(node)
-    order = sorted(buckets)
-    kept: list = []
-    index = 0
-    while len(kept) < limit:
-        progressed = False
-        for port in order:
-            bucket = buckets[port]
-            if index < len(bucket):
-                kept.append(bucket[index])
-                progressed = True
-                if len(kept) == limit:
-                    break
-        if not progressed:
-            break
-        index += 1
-    return kept
-
-
 def cap_nodes(nodes: list, limit: int) -> list:
-    """Trim the pool to ``limit`` nodes, originals before mirrors.
+    """Trim the pool to ``limit`` nodes.
 
-    A node that came from a source outranks one rule 9 invented: the original
-    is a configuration someone published, while its twin is this pipeline's
-    guess that the same credentials also work on the other port. So the cap is
-    filled with originals first, and mirrors only get whatever room is left.
-    Within each of those two tiers the two ports are drawn from alternately,
-    so neither tier collapses onto a single port.
+    This used to interleave two port buckets and rank source nodes above the
+    twins rule 9 invented. Rule 9 converts rather than duplicates now, so every
+    node is an original on port 443 and there is nothing left to balance or
+    rank -- the first ``limit`` will do, and keeping input order makes the
+    choice deterministic.
     """
-    if len(nodes) <= limit:
-        return nodes
-    originals = [n for n in nodes if not n.is_mirror]
-    mirrors = [n for n in nodes if n.is_mirror]
-    kept = _round_robin_by_port(originals, limit)
-    if len(kept) < limit:
-        kept += _round_robin_by_port(mirrors, limit - len(kept))
-    return kept
+    return nodes if len(nodes) <= limit else nodes[:limit]
 
 
 def locate_xray() -> str:
@@ -270,9 +234,7 @@ def render(links: list[str], counts: dict, sources: list[str]) -> str:
         f"#profile-title: {PROFILE_TITLE}",
         f"#profile-update-interval: {UPDATE_INTERVAL_DAYS}",
         f"#profile-web-page-url: {PROFILE_PAGE}",
-        f"# {len(links)} nodes"
-        f" ({counts.get('final_443', 0)} on 443, {counts.get('final_8080', 0)} on 8080"
-        " before health check)",
+        f"# {len(links)} nodes, from {counts.get('final_total', 0)} tested",
         f"# generated {stamp} from {len(sources)} source(s):",
         *(f"#   {url}" for url in sources),
         f"# criterion: a real proxied request succeeded in all"
@@ -363,30 +325,22 @@ def main() -> int:
         "dropped_rule_3_no_host",
         "dropped_rule_4_port",
         "dropped_rule_7_8080_with_tls",
+        "converted_to_tls_rule_9",
         "dropped_rule_8_443_without_tls",
         "kept_after_rules_1_to_8",
-        "mirrors_added_rule_9",
         "dropped_duplicate",
     ):
         if counts.get(key):
             print(f"  {key}: {counts[key]}")
-    print(
-        f"  {counts['final_total']} nodes to test"
-        f" ({counts['final_443']} on 443, {counts['final_8080']} on 8080)"
-    )
+    print(f"  {counts['final_total']} nodes to test")
 
     if len(transformed) > MAX_NODES_TO_TEST:
         dropped = len(transformed) - MAX_NODES_TO_TEST
         transformed = cap_nodes(transformed, MAX_NODES_TO_TEST)
         counts["dropped_over_cap"] = dropped
-        counts["final_443"] = sum(1 for n in transformed if n.port == "443")
-        counts["final_8080"] = sum(1 for n in transformed if n.port == "8080")
         counts["final_total"] = len(transformed)
-        print(
-            f"  capped to {MAX_NODES_TO_TEST} nodes for the health check"
-            f" ({dropped} dropped, {counts['final_443']} on 443,"
-            f" {counts['final_8080']} on 8080)"
-        )
+        print(f"  capped to {MAX_NODES_TO_TEST} nodes for the health check"
+              f" ({dropped} dropped)")
 
     if os.environ.get("SKIP_HEALTHCHECK") == "1":
         print("Skipping rule 14 (SKIP_HEALTHCHECK=1)")
@@ -408,11 +362,7 @@ def main() -> int:
             )
             return 1
         healthy = healthcheck.check(xray, transformed, counts, rounds=rounds)
-        healthy_443 = sum(1 for node in healthy if node.port == "443")
-        print(
-            f"  {len(healthy)} healthy"
-            f" ({healthy_443} on 443, {len(healthy) - healthy_443} on 8080)"
-        )
+        print(f"  {len(healthy)} healthy")
 
     if len(healthy) < MIN_HEALTHY_NODES:
         print(
