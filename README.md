@@ -59,6 +59,8 @@ https://github.com/ebrasha/free-v2ray-public-list
 
 https://github.com/MatinGhanbari/v2ray-configs
 
+https://github.com/SoliSpirit/v2ray-configs
+
 
 ## حمایت
 
