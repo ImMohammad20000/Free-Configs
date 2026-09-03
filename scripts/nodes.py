@@ -1,12 +1,13 @@
-"""Share-link model shared by the transform and health-check stages.
+"""Share-link model used by the build and health-check stages.
 
 Parses ``vless://``, ``trojan://`` and ``vmess://`` share links into a common
 :class:`Node`, re-serialises them, and renders the equivalent Xray-core
-outbound JSON that the health check runs.
+outbound JSON that the health check runs. Nothing here rewrites a node's
+settings -- what a source sent is what gets tested and published.
 
 Parameter values live *decoded* on the node; percent-encoding happens only in
-:meth:`Node.to_link` via ``quote(value, safe="")``.  That is what makes the
-``fm``/``cs`` values round-trip byte-for-byte.
+:meth:`Node.to_link` via ``quote(value, safe="")``.  That is what makes values
+like a source's own ``fm``/``cs`` round-trip byte-for-byte.
 """
 
 from __future__ import annotations
@@ -20,19 +21,8 @@ from urllib.parse import quote, unquote
 SUPPORTED_SCHEMES = ("vless", "trojan", "vmess")
 
 # Transport names that mean the same thing. The pipeline keeps whatever the
-# source wrote (rule 2 accepts both "ws" and "websocket"); only the Xray
-# outbound builder canonicalises.
+# source wrote; only the Xray outbound builder canonicalises.
 WS_ALIASES = ("ws", "websocket")
-
-# Query keys carrying "don't verify the certificate", in every spelling seen in
-# the wild. Rule 11 strips all of them.
-INSECURE_KEYS = ("allowinsecure", "allow_insecure", "insecure")
-
-# Encrypted Client Hello. Rule 11 strips this too: ECH encrypts the SNI, and
-# rule 12 sets the SNI to the fronted host precisely so Cloudflare can route on
-# it. The values seen in these lists ("ip.gs+udp://8.8.8.8") also make the
-# client fetch an ECH config over DNS before it can connect at all.
-ECH_KEYS = ("ech",)
 
 # Stable emit order, so an unchanged upstream produces a byte-identical
 # configs.txt and the daily commit is a real diff rather than noise.
@@ -47,6 +37,9 @@ PARAM_ORDER = (
     "sni",
     "alpn",
     "fp",
+    "pbk",
+    "sid",
+    "spx",
     "cs",
     "fm",
     "flow",
@@ -224,7 +217,7 @@ class Node:
             stream["security"] = "tls"
             tls: dict = {
                 "serverName": self.get("sni") or self.host or self.address,
-                "allowInsecure": False,
+                "allowInsecure": self.get("allowinsecure", "").lower() in ("1", "true"),
             }
             if self.get("fp"):
                 tls["fingerprint"] = self.get("fp")
@@ -233,6 +226,18 @@ class Node:
             if self.get("alpn"):
                 tls["alpn"] = [a for a in self.get("alpn").split(",") if a]
             stream["tlsSettings"] = tls
+        elif self.security == "reality":
+            stream["security"] = "reality"
+            reality: dict = {"serverName": self.get("sni") or self.host or self.address}
+            if self.get("fp"):
+                reality["fingerprint"] = self.get("fp")
+            if self.get("pbk"):
+                reality["publicKey"] = self.get("pbk")
+            if self.get("sid"):
+                reality["shortId"] = self.get("sid")
+            if self.get("spx"):
+                reality["spiderX"] = self.get("spx")
+            stream["realitySettings"] = reality
         else:
             stream["security"] = "none"
 

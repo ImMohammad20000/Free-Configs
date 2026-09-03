@@ -1,15 +1,17 @@
-"""Tests for the transform rules and the share-link parser.
+"""Tests for the share-link parser and the health-check pipeline.
 
     python scripts/test_rules.py
 
-No test framework needed. Every numbered rule from the spec has at least one
-test named after it, plus parser edge cases and end-to-end properties.
+No test framework needed. Nodes are no longer rewritten by this pipeline --
+they are parsed, deduplicated, health-checked and published exactly as their
+sources wrote them -- so these tests cover the parser, the Xray outbound
+renderer, the health check itself, and the build's fetch/dedup/cap/publish
+behaviour.
 """
 
 from __future__ import annotations
 
 import base64
-import collections
 import contextlib
 import http.client
 import io
@@ -28,7 +30,6 @@ from urllib.parse import quote
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import build  # noqa: E402
-import transform  # noqa: E402
 from nodes import Node, parse_line  # noqa: E402
 
 FAILURES: list[str] = []
@@ -53,175 +54,8 @@ def link(**kwargs) -> str:
     return f"vless://{uid}@{address}:{port}?{query}#{tag}"
 
 
-def one(**kwargs) -> list[Node]:
-    """Run the full transform over a single synthetic link."""
-    node = parse_line(link(**kwargs))
-    assert node is not None, "test input did not parse"
-    return transform.transform([node], {})
-
-
-def survives(**kwargs) -> bool:
-    return len(one(**kwargs)) > 0
-
-
 BASE = dict(security="tls", type="ws", host="a.example", path="/")
 
-
-# --- rule 1: security ------------------------------------------------------
-
-for value, expected in (("reality", False), ("tls", True), ("none", True), ("xtls", False)):
-    got = survives(**{**BASE, "security": value, "port": "443" if value == "tls" else "8080"})
-    check(got == expected, f"rule 1: security={value!r} should {'survive' if expected else 'drop'}")
-
-check(survives(security=None, type="ws", host="a.example", port="8080"), "rule 1: absent security survives")
-
-# --- rule 2: transport -----------------------------------------------------
-
-for value in transform.ALLOWED_TRANSPORTS:
-    check(survives(**{**BASE, "type": value}), f"rule 2: type={value!r} should survive")
-for value in ("tcp", "raw", "kcp", "h2", ""):
-    check(not survives(**{**BASE, "type": value}), f"rule 2: type={value!r} should drop")
-
-# --- rule 3: host ----------------------------------------------------------
-
-check(not survives(security="tls", type="ws", path="/", host=None), "rule 3: missing host drops")
-check(not survives(**{**BASE, "host": ""}), "rule 3: empty host drops")
-check(not survives(**{**BASE, "host": "   "}), "rule 3: whitespace-only host drops")
-
-# --- rules 4/5/6: ports ----------------------------------------------------
-
-for port in transform.PORTS_MAPPED_TO_443:
-    result = one(**{**BASE, "port": port})
-    check(bool(result), f"rule 4: port {port} accepted")
-    check(any(n.port == "443" for n in result), f"rule 5: port {port} maps to 443")
-
-for port in transform.PORTS_MAPPED_TO_8080:
-    result = one(**{**BASE, "security": "none", "port": port})
-    check(bool(result), f"rule 4: port {port} accepted")
-    # Rule 6 puts it on 8080, then rule 9 moves it to 443, so end to end it
-    # lands on 443. Rule 6 itself is checked in isolation, since its result is
-    # now an intermediate state no published node is ever left in.
-    check(all(n.port == "443" for n in result), f"rules 6+9: port {port} ends up on 443")
-    staged = parse_line(link(**{**BASE, "security": "none", "port": port}))
-    transform.rule_6_normalise_to_8080(staged)
-    check(staged.port == "8080", f"rule 6 isolated: port {port} normalises to 8080")
-
-for port in ("22", "8444", "0", "65536", "443abc", "", "abc"):
-    check(not survives(**{**BASE, "port": port}), f"rule 4: port {port!r} rejected")
-
-check(parse_line("vless://uid@1.2.3.4?type=ws&host=a.example").port == "", "rule 4: no port parses as empty")
-check(not survives(**{**BASE, "port": " 443"}), "rule 4: padded port rejected")
-
-# --- rules 7/8: security must match the port -------------------------------
-
-check(not survives(security="tls", type="ws", host="a.example", port="8080"),
-      "rule 7: 8080 + tls drops")
-check(not survives(security="none", type="ws", host="a.example", port="443"),
-      "rule 8: 443 + non-tls drops")
-check(not survives(type="ws", host="a.example", port="2053"),
-      "rule 8: 443-bucket without security drops")
-
-# --- rule 9: plaintext nodes are converted to TLS --------------------------
-
-# A TLS node passes through untouched.
-result = one(**BASE)
-check(len(result) == 1, "rule 9: a node is no longer duplicated")
-only = result[0]
-check(only.port == "443" and only.security == "tls", "rule 9: a TLS node stays as it is")
-
-# A plaintext node is moved onto 443 with TLS and an sni naming its host.
-result = one(security="none", type="ws", host="b.example", path="/", port="8080")
-check(len(result) == 1, "rule 9: a plaintext node yields one node, not two")
-moved = result[0]
-check(moved.port == "443", "rule 9: a plaintext node moves to port 443")
-check(moved.security == "tls", "rule 9: the converted node carries security=tls")
-check(moved.get("sni") == "b.example", "rule 9: the converted node gets sni=host")
-
-# Nothing anywhere may still be on 8080 -- that is the whole point.
-for spec in ({}, {"security": "none", "port": "8080"}, {"port": "2082", "security": "none"},
-             {"port": "2053"}, {"port": "8880", "security": "none"}):
-    for node in one(**{**BASE, **spec}):
-        check(node.port == "443", f"rule 9: {spec or 'default'} ends up on 443")
-        check(node.security == "tls", f"rule 9: {spec or 'default'} ends up on TLS")
-
-# rule_9_convert_to_tls in isolation.
-probe = parse_line(link(security="none", type="ws", host="c.example", path="/", port="8080"))
-probe.port = "8080"
-transform.rule_9_convert_to_tls(probe)
-check(probe.port == "443" and probe.security == "tls" and probe.get("sni") == "c.example",
-      "rule 9 isolated: a plaintext node is converted in place")
-already = parse_line(link(**BASE))
-already.set("sni", "orig.example")
-transform.rule_9_convert_to_tls(already)
-check(already.port == "443" and already.get("sni") == "orig.example",
-      "rule 9 isolated: a node already on 443 is left alone")
-
-# --- rule 10: exit address -------------------------------------------------
-
-for node in one(**BASE):
-    check(node.address == transform.EXIT_ADDRESS, "rule 10: the node uses the exit address")
-
-probe = parse_line(link(**BASE))
-probe.address = "0.0.0.0"
-transform.rule_10_set_address(probe)
-check(probe.address == transform.EXIT_ADDRESS, "rule 10: the setter applies the exit address")
-
-# --- rule 11: strip certificate opt-outs -----------------------------------
-
-for spelling in ("allowInsecure", "allow_insecure", "insecure", "ALLOWINSECURE",
-                 "AllowInsecure", "ech", "ECH", "Ech"):
-    result = one(**{**BASE, spelling: "1"})
-    check(
-        all(not n.has(spelling) for n in result),
-        f"rule 11: {spelling} removed",
-    )
-    check(
-        all(f"{spelling.lower()}=" not in n.to_link().lower() for n in result),
-        f"rule 11: {spelling} absent from the emitted link",
-    )
-
-# ech is stripped even when it sits beside parameters that must survive.
-survivor = one(**{**BASE, "ech": "ip.gs+udp://8.8.8.8"})
-for node in survivor:
-    check(not node.has("ech"), "rule 11: ech removed from the node")
-    check("ech=" not in node.to_link(), "rule 11: ech absent from the emitted link")
-    check(node.get("host") == "a.example" and node.get("type") == "ws",
-          "rule 11: stripping ech leaves the other parameters intact")
-check(len(survivor) == 1, "rule 11: stripping ech does not drop the node")
-
-# --- rule 12: masking parameters -------------------------------------------
-
-for node in one(**BASE):
-    check(node.get("fp") == "unsafe", "rule 12: fp=unsafe")
-    check(node.get("fm") == transform.FM_443, "rule 12: fm value")
-    check(node.get("cs") == transform.CS_443, "rule 12: cs value")
-    emitted = node.to_link()
-    check(transform.FM_443_ENCODED in emitted, "rule 12: fm is byte-exact in the link")
-    check(transform.CS_443_ENCODED in emitted, "rule 12: cs is byte-exact in the link")
-    check("fp=unsafe" in emitted, "rule 12: fp is byte-exact in the link")
-
-# A converted plaintext node gets the same masking as any other.
-for node in one(security="none", type="ws", host="d.example", path="/", port="8080"):
-    check(node.get("fp") == "unsafe" and node.get("fm") == transform.FM_443
-          and node.get("cs") == transform.CS_443,
-          "rule 12: a converted node is masked like any other")
-
-# A node arriving with stale TLS parameters has them overwritten by rule 12
-# rather than stripped -- there is no plaintext output to strip them for.
-inherited = one(
-    security="none", type="ws", host="c.example", path="/", port="8080",
-    alpn="h2,http/1.1", fp="chrome", cs="TLS_AES_128_GCM_SHA256", sni="stale.example",
-)
-check(len(inherited) == 1, "rule 12: a converted node is still a single node")
-converted = inherited[0]
-check(converted.get("fp") == "unsafe", "rule 12: a stale fp is overwritten")
-check(converted.get("cs") == transform.CS_443, "rule 12: a stale cs is overwritten")
-check(converted.get("sni") == "c.example", "rule 12: a stale sni is replaced by the host")
-
-# Existing values must be overwritten, not kept ("set/change").
-for node in one(**{**BASE, "fp": "chrome", "fm": "junk", "cs": "junk"}):
-    check(node.get("fp") == "unsafe", "rule 12: existing fp is overwritten")
-    check(node.get("fm") == transform.FM_443, "rule 12: existing fm is overwritten")
 
 # --- parser edge cases -----------------------------------------------------
 
@@ -252,21 +86,19 @@ check(parse_line("garbage") is None, "parser: no scheme separator")
 node = parse_line("vless://uid@h.example:443?Host=Cap.example&type=ws&security=tls#n")
 check(node is not None and node.host == "Cap.example", "parser: capitalised Host is found")
 
+node = parse_line("vless://uid@h.example:8080?type=ws&host=a.example&security=reality#n")
+check(node is not None and node.security == "reality", "parser: any security value parses, unfiltered")
+
+node = parse_line("vless://uid@h.example:9999?type=grpc&host=a.example#n")
+check(node is not None and node.port == "9999", "parser: any port parses, unfiltered")
+
 # Round trip: emitting and re-parsing must be stable.
-for node in one(**BASE):
-    emitted = node.to_link()
-    reparsed = parse_line(emitted)
-    check(reparsed is not None and reparsed.to_link() == emitted, "parser: emit/parse round trip")
+node = parse_line(link(**BASE))
+emitted = node.to_link()
+reparsed = parse_line(emitted)
+check(reparsed is not None and reparsed.to_link() == emitted, "parser: emit/parse round trip")
 
-# --- dedup -----------------------------------------------------------------
-
-pair = [parse_line(link(**BASE)), parse_line(link(**BASE))]
-check(len(transform.transform(pair, {})) == 1, "dedup: identical inputs collapse to one node")
-
-differing = [parse_line(link(**BASE)), parse_line(link(**{**BASE, "host": "other.example"}))]
-check(len(transform.transform(differing, {})) == 2, "dedup: different hosts stay distinct")
-
-# --- vmess -----------------------------------------------------------------
+# --- vmess -------------------------------------------------------------------
 
 VMESS = (
     "vmess://eyJ2IjoiMiIsInBzIjoibiIsImFkZCI6IjEuMi4zLjQiLCJwb3J0IjoiNDQzIiwiaWQiOiJ1aWQiLCJhaWQi"
@@ -278,12 +110,6 @@ check(node is not None and node.scheme == "vmess", "vmess: parses")
 check(node is not None and node.transport == "ws", "vmess: net maps to transport")
 check(node is not None and node.security == "tls", "vmess: tls maps to security")
 check(node is not None and node.host == "a.example", "vmess: host")
-check(transform.INCLUDE_VMESS is False, "vmess: excluded by default (cannot carry fm/cs)")
-check(len(transform.transform([parse_line(VMESS)], {})) == 0, "vmess: dropped by the transform")
-
-# vmess serialisation is only reachable when INCLUDE_VMESS is turned on, but a
-# toggle nobody exercises is a toggle that breaks silently. These also verify
-# the reason it is off: a vmess link genuinely cannot carry fm or cs.
 
 VMESS_FULL = "vmess://" + base64.b64encode(json.dumps({
     "v": "2", "ps": "original name", "add": "9.9.9.9", "port": "2053",
@@ -309,69 +135,78 @@ check(user["alterId"] == 0 and user["security"] == "aes-128-gcm",
       "vmess: alterId and cipher reach the outbound")
 check(outbound["streamSettings"]["network"] == "ws", "vmess: net maps to the stream network")
 
-real_include = transform.INCLUDE_VMESS
-try:
-    transform.INCLUDE_VMESS = True
-    vm_out = transform.transform([parse_line(VMESS_FULL)], {})
-    check(len(vm_out) == 1, "vmess: with the toggle on it survives as a single node")
-    vm443 = vm_out[0]
-    check(vm443.address == transform.EXIT_ADDRESS and vm443.security == "tls",
-          "vmess: rules 8 and 10 apply to a vmess node")
-    check(vm443.port == "443", "vmess: a vmess node ends up on 443 like any other")
-    check(vm443.get("fm") == transform.FM_443 and vm443.get("cs") == transform.CS_443,
-          "vmess: rule 12 sets fm and cs on the node")
+# --- Xray outbound rendering: nodes are rendered as-is, nothing is injected ---
 
-    # The documented limitation, verified rather than assumed: the vmess wire
-    # format has a fixed key set with nowhere to put fm or cs, so they are
-    # silently lost on serialisation. That is why the toggle defaults to off.
-    payload = json.loads(base64.b64decode(
-        vm443.to_link().split("://", 1)[1] + "=="
-    ).decode("utf-8", "replace"))
-    check("fm" not in payload and "cs" not in payload,
-          "vmess: the wire format has nowhere to carry fm or cs")
-    check(transform.FM_443_ENCODED not in vm443.to_link(),
-          "vmess: fm really is absent from the emitted link")
-    check(payload["tls"] == "tls" and payload["sni"] == "vm.example",
-          "vmess: what the format can carry is still carried")
-    check(payload["add"] == transform.EXIT_ADDRESS and payload["port"] == "443",
-          "vmess: the rewritten address and port reach the wire format")
-finally:
-    transform.INCLUDE_VMESS = real_include
+node = parse_line(link(**BASE, fp="chrome", cs="TLS_AES_128_GCM_SHA256"))
+outbound = json.loads(json.dumps(node.to_outbound("t")))
+stream = outbound["streamSettings"]
+check(outbound["protocol"] == "vless", "outbound: protocol")
+check(stream["network"] == "ws", "outbound: network")
+check(stream["wsSettings"]["host"] == "a.example", "outbound: ws host header")
+check(stream["security"] == "tls", "outbound: security is carried through as-is")
+check(stream["tlsSettings"]["fingerprint"] == "chrome",
+      "outbound: fp is carried through from the source, not overwritten")
+check(stream["tlsSettings"]["cipherSuites"] == "TLS_AES_128_GCM_SHA256",
+      "outbound: cs is carried through from the source, not overwritten")
+check(stream["tlsSettings"]["allowInsecure"] is False,
+      "outbound: allowInsecure defaults to false when the source did not ask for it")
+check("finalmask" not in stream,
+      "outbound: no fm is injected when the source did not provide one")
 
-# --- masking constants round trip ------------------------------------------
+insecure_node = parse_line(link(**{**BASE, "allowinsecure": "1"}))
+check(
+    insecure_node.to_outbound("t")["streamSettings"]["tlsSettings"]["allowInsecure"] is True,
+    "outbound: allowInsecure follows the source's own allowinsecure param, unstripped",
+)
 
-for name, encoded, decoded in (
-    ("FM_443", transform.FM_443_ENCODED, transform.FM_443),
-    ("CS_443", transform.CS_443_ENCODED, transform.CS_443),
-):
-    check(quote(decoded, safe="") == encoded, f"constants: {name} survives a decode/encode cycle")
+FM_VALUE = json.dumps({"tcp": [{"type": "fragment", "settings": {"packets": "tlshello"}}]})
+fm_node = parse_line(link(**{**BASE, "fm": FM_VALUE}))
+check(fm_node.get("fm") == FM_VALUE, "parser: a source-provided fm value round-trips")
+check(
+    "finalmask" in fm_node.to_outbound("t")["streamSettings"],
+    "outbound: fm is rendered when the source itself provides one",
+)
 
-# --- Xray outbound rendering ----------------------------------------------
+plain_node = parse_line(link(**{**BASE, "security": "none"}))
+check(plain_node.to_outbound("t")["streamSettings"]["security"] == "none",
+      "outbound: security=none is honoured, not forced to tls")
 
+grpc_node = parse_line(link(**{**BASE, "type": "grpc", "serviceName": "gs"}))
+outbound = grpc_node.to_outbound("t")
+check(outbound["streamSettings"]["network"] == "grpc", "outbound: grpc network")
+check(
+    outbound["streamSettings"]["grpcSettings"]["authority"] == "a.example",
+    "outbound: grpc authority comes from host",
+)
 
-for node in one(**BASE):
-    outbound = json.loads(json.dumps(node.to_outbound("t")))
-    stream = outbound["streamSettings"]
-    check(outbound["protocol"] == "vless", "outbound: protocol")
-    check(stream["network"] == "ws", "outbound: network")
-    check(isinstance(stream.get("finalmask"), dict), "outbound: fm becomes a finalmask object")
-    check(stream["wsSettings"]["host"] == "a.example", "outbound: ws host header")
-    if node.port == "443":
-        check(stream["security"] == "tls", "outbound: 443 uses tls")
-        check(stream["tlsSettings"]["fingerprint"] == "unsafe", "outbound: fingerprint")
-        check(stream["tlsSettings"]["cipherSuites"] == transform.CS_443, "outbound: cipherSuites")
-        check(stream["tlsSettings"]["allowInsecure"] is False, "outbound: never skips verification")
-    else:
-        check(stream["security"] == "none", "outbound: 8080 is plaintext")
-
-grpc = one(**{**BASE, "type": "grpc", "serviceName": "gs"})
-for node in grpc:
-    outbound = node.to_outbound("t")
-    check(outbound["streamSettings"]["network"] == "grpc", "outbound: grpc network")
-    check(
-        outbound["streamSettings"]["grpcSettings"]["authority"] == "a.example",
-        "outbound: grpc authority comes from host",
-    )
+# reality: not part of the old TLS-only shape, but common upstream and must be
+# tested faithfully rather than mis-rendered as plaintext.
+REALITY = (
+    "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443"
+    "?security=reality&type=tcp&sni=r.example&pbk=PUBKEY&sid=ab12"
+    "&fp=chrome&flow=xtls-rprx-vision#reality"
+)
+reality_node = parse_line(REALITY)
+check(reality_node is not None and reality_node.security == "reality", "parser: reality security parses")
+r_outbound = reality_node.to_outbound("t")
+r_stream = r_outbound["streamSettings"]
+check(r_stream["security"] == "reality", "outbound: reality security is honoured")
+r_settings = r_stream["realitySettings"]
+check(r_settings["serverName"] == "r.example", "outbound: reality serverName comes from sni")
+check(r_settings["publicKey"] == "PUBKEY", "outbound: reality publicKey comes from pbk")
+check(r_settings["shortId"] == "ab12", "outbound: reality shortId comes from sid")
+check(r_settings["fingerprint"] == "chrome", "outbound: reality fingerprint comes from fp")
+check("tlsSettings" not in r_stream, "outbound: reality does not also carry tlsSettings")
+check(
+    r_outbound["settings"]["vnext"][0]["users"][0]["flow"] == "xtls-rprx-vision",
+    "outbound: flow reaches the outbound",
+)
+reparsed_reality = parse_line(reality_node.to_link())
+check(
+    reparsed_reality is not None and reparsed_reality.get("pbk") == "PUBKEY"
+    and reparsed_reality.get("sid") == "ab12",
+    "parser: reality params round-trip through emit/parse",
+)
 
 # --- health check: routing safety and bisection ------------------------------
 # These do not need a network or an Xray binary, but they guard the property
@@ -380,7 +215,10 @@ for node in grpc:
 
 import healthcheck  # noqa: E402
 
-batch = [n for spec in ({}, {"host": "b.example"}, {"host": "c.example"}) for n in one(**{**BASE, **spec})]
+batch = [
+    parse_line(link(**{**BASE, **spec}))
+    for spec in ({}, {"host": "b.example"}, {"host": "c.example"})
+]
 batch_ports = healthcheck._placeholder_ports(len(batch))
 config = healthcheck._build_config(batch, batch_ports)
 
@@ -482,7 +320,9 @@ try:
         return (port % 2 == 0, float(port))
 
     healthcheck._probe = _record
-    mapped = healthcheck._run_batch("xray", scored_batch := [n for n in one(**BASE)] * 3,
+    base_node = parse_line(link(**BASE))
+    scored_batch = [base_node, base_node, base_node]
+    mapped = healthcheck._run_batch("xray", scored_batch,
                                     tempfile.gettempdir(), "unit",
                                     healthcheck.TEST_ENDPOINTS[0])
 finally:
@@ -535,7 +375,7 @@ try:
     healthcheck.reserve_ports = _refuse
     with contextlib.redirect_stdout(io.StringIO()) as captured:
         result = healthcheck._run_batch(
-            "xray", [n for n in one(**BASE)], tempfile.gettempdir(), "unit",
+            "xray", [parse_line(link(**BASE))], tempfile.gettempdir(), "unit",
             healthcheck.TEST_ENDPOINTS[0],
         )
     check(result == {}, "ports: a batch that cannot reserve ports is simply untested")
@@ -581,7 +421,7 @@ check(
 # check() decides what is published. A node must pass EVERY round: passing
 # some rounds is what "flaky" means, and publishing those is the mistake the
 # three-round design exists to avoid.
-scored = [n for i in range(5) for n in one(**{**BASE, "host": f"n{i}.example"})][:5]
+scored = [parse_line(link(**{**BASE, "host": f"n{i}.example"})) for i in range(5)]
 for index, node in enumerate(scored):
     node.tag = f"node-{index}"
 
@@ -647,26 +487,15 @@ finally:
     # Leaving this stubbed would silently feed the endpoint tests below.
     healthcheck.usable_endpoints = real_usable_endpoints
 
-# The preflight has to exercise both shapes the pipeline emits, or it proves
-# nothing about the core it is about to trust.
+# The preflight just has to prove the binary can build a basic config before
+# the real pool is spent on it.
 probes = healthcheck.preflight_probes()
-check({node.port for _, node in probes} == {"443"},
-      "healthcheck: preflight checks the one shape the pipeline emits")
-tls_probe = probes[0][1]
-check(
-    tls_probe.get("fp") == "unsafe"
-    and tls_probe.get("fm") == transform.FM_443
-    and tls_probe.get("cs") == transform.CS_443,
-    "healthcheck: the probe carries the real fp, fm and cs values",
-)
-check(tls_probe.security == "tls", "healthcheck: the probe is a TLS outbound")
-check(
-    all(node.address == transform.EXIT_ADDRESS for _, node in probes),
-    "healthcheck: probes use the real exit address, not a placeholder",
-)
-for _, node in probes:
-    rendered = json.dumps(healthcheck._build_config([node], healthcheck._placeholder_ports(1)))
-    check("finalmask" in rendered, f"healthcheck: the port {node.port} probe renders a finalmask")
+check(len(probes) == 1, "healthcheck: preflight has one baseline probe")
+_, probe_node = probes[0]
+check(probe_node.port == "443" and probe_node.security == "tls",
+      "healthcheck: the probe is a basic ws+tls outbound")
+rendered = json.dumps(healthcheck._build_config([probe_node], healthcheck._placeholder_ports(1)))
+check('"network": "ws"' in rendered, "healthcheck: the probe config renders a ws outbound")
 
 
 # Endpoint selection and the pass/fail decision inside _probe. Both are stubbed
@@ -739,19 +568,15 @@ try:
     healthcheck.usable_endpoints = lambda: []
     raised = False
     try:
-        healthcheck.check("xray", [n for n in one(**BASE)], {}, rounds=1)
+        healthcheck.check("xray", [parse_line(link(**BASE))], {}, rounds=1)
     except healthcheck.HealthCheckError:
         raised = True
     check(raised, "endpoints: no reachable endpoint aborts rather than failing every node")
 finally:
     healthcheck.usable_endpoints = real_usable
 
-# The cap on how many nodes reach the health check. Rule 9 converts rather than
-# duplicates now, so there are no mirrors to rank below originals and no second
-# port to balance against -- the cap is a plain trim that keeps input order.
-pool = []
-for i in range(60):
-    pool += one(**{**BASE, "host": f"t{i}.example"})
+# The cap on how many nodes reach the health check.
+pool = [parse_line(link(**{**BASE, "host": f"t{i}.example"})) for i in range(60)]
 check(len(pool) == 60, "cap: test pool built")
 check(all(n.port == "443" for n in pool), "cap: every node in the pool is on 443")
 
@@ -772,7 +597,6 @@ check(build.cap_nodes([], 10) == [], "cap: an empty pool is handled")
 # A truncated response raises IncompleteRead, which is an HTTPException and NOT
 # an OSError, so a handler catching only OSError silently skips the retry and
 # lets the error escape as a traceback.
-
 
 
 for exc in (
@@ -897,7 +721,6 @@ finally:
 # test stays offline.
 
 
-
 SERVERS: list[socket.socket] = []
 
 
@@ -983,6 +806,10 @@ completed, _, produced = run_build(
 check(completed.returncode == 0, "sources: a dead source does not fail the build")
 check("live.example" in produced, "sources: the surviving source still publishes")
 check("unreachable source" in completed.stdout, "sources: the dead source is reported")
+check(
+    parse_line([l for l in produced.splitlines() if "live.example" in l][0]).port == "2053",
+    "sources: a published node keeps its original port, not rewritten to 443",
+)
 
 # A URL with no scheme is the likeliest typo in a hand-edited sources.txt.
 # urllib raises ValueError for it, which is not a URLError, so left unhandled
@@ -1018,7 +845,7 @@ check(len(emitted) == 1, "dedup: four spellings of one node yield one published 
 # Names are percent-encoded on the wire, so decode before comparing.
 names = [parse_line(l).tag for l in emitted]
 check(all(n.startswith("FIRST NAME") for n in names),
-      "dedup: the surviving copy keeps its source comment in the published name")
+      "dedup: the surviving copy keeps its source comment in the published name, unchanged")
 
 # Order-insensitivity at the identity level, independent of the build.
 a = parse_line(f"vless://{UID}@9.9.9.9:443?security=tls&type=ws&host=x.example#one")
@@ -1029,8 +856,7 @@ c = parse_line(f"vless://{UID}@9.9.9.9:443?security=tls&type=ws&host=OTHER.examp
 check(a.identity() != c.identity(),
       "dedup: a genuinely different node keeps a different identity")
 
-# The cap has to be wired into the build, not just implemented. Six distinct
-# nodes become twelve after rule 9; a cap of 4 must leave exactly 4.
+# The cap has to be wired into the build, not just implemented.
 SIX = "".join(
     f"vless://55555555-5555-5555-5555-55555555555{i}@9.9.9.9:2053"
     f"?security=tls&type=ws&host=c{i}.example&path=/#n{i}\n"
@@ -1043,8 +869,8 @@ check(completed.returncode == 0, "cap: a capped build succeeds")
 check(len(capped) == 4, "cap: the build tests only the capped number of nodes")
 check("capped to 4 nodes" in completed.stdout, "cap: the build reports that it capped")
 check("2 dropped" in completed.stdout, "cap: the build reports how many it dropped")
-check(all(parse_line(l).port == "443" for l in capped),
-      "cap: everything published is on 443")
+check(all(parse_line(l).port == "2053" for l in capped),
+      "cap: capped nodes keep their original port, not rewritten")
 
 # Under the cap, nothing is dropped and nothing is reported.
 completed, _, produced = run_build(serve(SIX), MAX_NODES_TO_TEST="500")
@@ -1064,20 +890,17 @@ completed, _, produced = run_build(
     serve(GOOD_BODY) + "," + serve(base64.b64encode(GOOD_BODY))
 )
 check(completed.returncode == 0, "sources: a base64 source is accepted")
-# One input node listed by both sources must yield exactly two output nodes --
-# itself and its rule 9 mirror -- not four.
+# The same node listed by two sources -- once plain, once base64-encoded --
+# must dedupe to one published node, not two.
 emitted = [l for l in produced.splitlines() if l and not l.startswith("#")]
 check(len(emitted) == 1, "sources: the same node from two sources is deduped")
-# Node-level dedup would collapse these anyway, so assert the line-level pass
-# actually ran -- it is what keeps a large overlapping source from being
-# parsed twice.
 check(
     "1 distinct configs parsed" in completed.stdout
     and "1 duplicates dropped" in completed.stdout,
     "sources: a repeated node is dropped once, not parsed twice",
 )
-check(parse_line(emitted[0]).port == "443",
-      "sources: the surviving node is published on 443")
+check(parse_line(emitted[0]).port == "2053",
+      "sources: the surviving node keeps its original port")
 
 for sock in SERVERS:
     sock.close()
@@ -1115,8 +938,8 @@ try:
             build.locate_xray()
             check(False, "locate: absent core is reported")
         except SystemExit as error:
-            check("v26.6.22" in str(error) and "XRAY_BIN" in str(error),
-                  "locate: absent core names both the fix and the version floor")
+            check("XRAY_BIN" in str(error),
+                  "locate: absent core names the fix")
     finally:
         build.shutil.which = _real_which
         build.REPO_ROOT = _real_root

@@ -1,4 +1,8 @@
-"""Rules 14-15: fetch, transform, health-check and publish the subscription.
+"""Fetch, health-check and publish the subscription.
+
+Nodes are tested and published exactly as their sources wrote them -- nothing
+here rewrites a node's address, port, security or any other setting. Only
+nodes that fail a real proxied connection through Xray-core are dropped.
 
     python scripts/build.py
 
@@ -10,7 +14,7 @@ Environment overrides:
                       overriding sources.txt. SOURCE_URL is accepted too.
     XRAY_BIN          path to the Xray-core binary (default: search PATH, then bin/xray)
     OUTPUT_DIR        where configs.txt is written (default: repository root)
-    SKIP_HEALTHCHECK  set to 1 to skip rule 14, for local dry runs
+    SKIP_HEALTHCHECK  set to 1 to skip the health check, for local dry runs
     HEALTHCHECK_ROUNDS number of independent rounds a node must pass (default 3)
     MAX_NODES_TO_TEST most nodes the health check may test (default 50000)
 """
@@ -31,7 +35,6 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import healthcheck  # noqa: E402
-import transform  # noqa: E402
 from nodes import parse_line  # noqa: E402
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -188,14 +191,8 @@ def fetch(url: str) -> str:
 
 
 def cap_nodes(nodes: list, limit: int) -> list:
-    """Trim the pool to ``limit`` nodes.
-
-    This used to interleave two port buckets and rank source nodes above the
-    twins rule 9 invented. Rule 9 converts rather than duplicates now, so every
-    node is an original on port 443 and there is nothing left to balance or
-    rank -- the first ``limit`` will do, and keeping input order makes the
-    choice deterministic.
-    """
+    """Trim the pool to ``limit`` nodes, keeping input order so the choice is
+    deterministic."""
     return nodes if len(nodes) <= limit else nodes[:limit]
 
 
@@ -215,9 +212,7 @@ def locate_xray() -> str:
         if os.path.exists(candidate):
             return candidate
     raise SystemExit(
-        "Xray-core binary not found. Set XRAY_BIN, or place it at bin/xray. "
-        "v26.6.22 or newer is required: earlier builds reject the fragment "
-        "'lengths'/'delays' arrays used by the fm parameter."
+        "Xray-core binary not found. Set XRAY_BIN, or place it at bin/xray."
     )
 
 
@@ -316,35 +311,21 @@ def main() -> int:
         )
         return 1
 
-    print("Applying rules 1-13")
-    transformed = transform.transform(nodes, counts)
-    for key in (
-        "dropped_vmess_cannot_carry_fm",
-        "dropped_rule_1_security",
-        "dropped_rule_2_transport",
-        "dropped_rule_3_no_host",
-        "dropped_rule_4_port",
-        "dropped_rule_7_8080_with_tls",
-        "converted_to_tls_rule_9",
-        "dropped_rule_8_443_without_tls",
-        "kept_after_rules_1_to_8",
-        "dropped_duplicate",
-    ):
-        if counts.get(key):
-            print(f"  {key}: {counts[key]}")
-    print(f"  {counts['final_total']} nodes to test")
+    counts["final_total"] = len(nodes)
+    print(f"  {len(nodes)} nodes to test")
 
-    if len(transformed) > MAX_NODES_TO_TEST:
-        dropped = len(transformed) - MAX_NODES_TO_TEST
-        transformed = cap_nodes(transformed, MAX_NODES_TO_TEST)
+    to_test = nodes
+    if len(to_test) > MAX_NODES_TO_TEST:
+        dropped = len(to_test) - MAX_NODES_TO_TEST
+        to_test = cap_nodes(to_test, MAX_NODES_TO_TEST)
         counts["dropped_over_cap"] = dropped
-        counts["final_total"] = len(transformed)
+        counts["final_total"] = len(to_test)
         print(f"  capped to {MAX_NODES_TO_TEST} nodes for the health check"
               f" ({dropped} dropped)")
 
     if os.environ.get("SKIP_HEALTHCHECK") == "1":
-        print("Skipping rule 14 (SKIP_HEALTHCHECK=1)")
-        healthy = transformed
+        print("Skipping the health check (SKIP_HEALTHCHECK=1)")
+        healthy = to_test
     else:
         rounds = int(os.environ.get("HEALTHCHECK_ROUNDS", healthcheck.ROUNDS))
         counts["rounds"] = rounds
@@ -356,12 +337,12 @@ def main() -> int:
             for item in unsupported:
                 print(f"  - {item}", file=sys.stderr)
             print(
-                "Use a build of https://github.com/patterniha/Xray-core based on"
-                " v26.6.22 or newer.",
+                "Install a standard build of Xray-core:"
+                " https://github.com/XTLS/Xray-core",
                 file=sys.stderr,
             )
             return 1
-        healthy = healthcheck.check(xray, transformed, counts, rounds=rounds)
+        healthy = healthcheck.check(xray, to_test, counts, rounds=rounds)
         print(f"  {len(healthy)} healthy")
 
     if len(healthy) < MIN_HEALTHY_NODES:

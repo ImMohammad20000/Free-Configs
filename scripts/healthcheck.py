@@ -1,10 +1,10 @@
-"""Rule 14: keep only nodes that actually carry traffic.
+"""Health check: keep only nodes that actually carry traffic.
 
 Reimplements the criterion the upstream project publishes in its own header --
 "a real proxied request to https://cp.cloudflare.com/generate_204 succeeded in
 ALL 3 independent runs" -- directly against Xray-core rather than a wrapper, so
-the ``fm`` / ``cs`` / ``fp=unsafe`` parameters in the emitted links are the ones
-being exercised.
+whatever parameters a node actually carries are the ones being exercised. Nodes
+are tested exactly as fetched from their sources; nothing here rewrites them.
 
 Shape of a round: nodes are grouped into batches; each batch becomes one Xray
 process with one loopback HTTP inbound per node, routed to that node's outbound.
@@ -45,7 +45,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
-import transform
 from nodes import Node
 
 
@@ -232,16 +231,13 @@ def validate_nodes(
 
 
 def preflight(xray: str) -> list[str]:
-    """Check that this core understands everything the emitted links rely on.
+    """Check that the binary actually works before spending time on the full
+    health check.
 
-    Without this, an unsupported parameter shows up as "every node is dead"
-    three rounds later, with nothing pointing at the cause. Each probe uses the
-    same config shape the health check builds, so a core that accepts these
-    accepts the real thing.
-
-    ``cs`` maps to Xray's ``cipherSuites``, which is undocumented, and the
-    ``fm`` fragment's ``lengths``/``delays`` arrays only exist in cores based on
-    v26.6.22 or newer -- both are worth proving rather than assuming.
+    Without this, a broken or wrong binary shows up as "every node is dead"
+    three rounds later, with nothing pointing at the binary as the cause. Each
+    probe uses the same config shape the health check builds, so a core that
+    accepts these accepts the real thing.
     """
     try:
         version = subprocess.run(
@@ -269,21 +265,15 @@ def preflight(xray: str) -> list[str]:
 
 
 def preflight_probes() -> list[tuple[str, Node]]:
-    """The configuration the pipeline emits: a TLS node on port 443 carrying
-    the full masking set.
-
-    There used to be a second probe for plaintext port 8080 nodes. Rule 9
-    converts those to TLS now, so that shape is never published. The address
-    comes from transform's rule 10 constant rather than being written out
-    again, so repointing the exit repoints what the preflight tests.
-    """
+    """A minimal, generic outbound shape, just to prove the binary can build a
+    config at all before the full health check spends time on the real pool."""
     return [
         (
-            "port 443 masking (fp=unsafe + fm fragment + cs cipherSuites)",
+            "a basic vless+ws+tls outbound",
             Node(
                 scheme="vless",
                 uid="00000000-0000-0000-0000-000000000000",
-                address=transform.EXIT_ADDRESS,
+                address="127.0.0.1",
                 port="443",
                 params={
                     "encryption": "none",
@@ -292,9 +282,6 @@ def preflight_probes() -> list[tuple[str, Node]]:
                     "host": "example.com",
                     "path": "/",
                     "sni": "example.com",
-                    "fp": transform.FP_443,
-                    "fm": transform.FM_443,
-                    "cs": transform.CS_443,
                 },
             ),
         ),

@@ -34,23 +34,23 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Test the transform rules
+      - name: Run the test suite
         run: python scripts/test_rules.py
 
       - name: Install newest Xray-core
         env:
           # patterniha/Xray-core, not XTLS/Xray-core. The fork drops the
           # validateOutboundTransportSecurity check that forbids VLESS/Trojan
-          # without TLS to a public address, which is exactly what every port
-          # 8080 node in this list is.
+          # without TLS to a public address. Nodes are tested exactly as their
+          # sources wrote them, and plenty of them are plaintext VLESS/Trojan
+          # pointed straight at a public IP.
           #
           # The newest release is resolved at run time, so publishing a release
           # in the fork is all it takes for the next build to pick it up. The
           # archive is checked against the SHA2-256 the release publishes
           # alongside it: that catches a truncated or corrupted download, but
           # since both files come from the same release it is not a defence
-          # against the release itself being replaced. scripts/build.py then
-          # preflights the core and fails if it does not support fm/cs/fp.
+          # against the release itself being replaced.
           XRAY_REPO: patterniha/Xray-core
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -89,7 +89,7 @@ jobs:
           "$RUNNER_TEMP/xray/xray" version | head -n 1
           echo "XRAY_BIN=$RUNNER_TEMP/xray/xray" >> "$GITHUB_ENV"
 
-      - name: Fetch, transform and health-check
+      - name: Fetch, health-check and publish
         run: python scripts/build.py
 
       - name: Commit and push
