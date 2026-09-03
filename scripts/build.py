@@ -50,7 +50,7 @@ OUTPUT_FILE = "configs.txt"
 OUTPUT_FILE_BASE64 = "configs_base64.txt"
 
 PROFILE_TITLE = "Free-Configs"
-PROFILE_PAGE = "https://github.com/patterniha/Free-Configs"
+PROFILE_PAGE = "https://github.com/ImMohammad20000/Free-Configs"
 # How often a client should re-fetch, in days, matching the workflow's cadence.
 UPDATE_INTERVAL_DAYS = 1
 
